@@ -1,0 +1,14 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local environments
+.venv/
+.env
+.env.*
+
+# Generated graph cache artifacts
+graphify-out/cache/
+backend/graphify-out/cache/
+

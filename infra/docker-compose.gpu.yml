@@ -1,0 +1,36 @@
+services:
+  triton:
+    image: nvcr.io/nvidia/tritonserver:latest
+    container_name: attendance-triton
+    restart: unless-stopped
+    shm_size: 1gb
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      stack: 67108864
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:8002:8002"
+    volumes:
+      - ./model_repository:/models:ro
+    command:
+      - tritonserver
+      - --model-repository=/models
+      - --strict-model-config=true
+      - --model-control-mode=poll
+      - --repository-poll-secs=15
+      - --grpc-infer-allocation-pool-size=32
+      - --log-verbose=0
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

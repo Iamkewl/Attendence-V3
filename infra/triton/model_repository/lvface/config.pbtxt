@@ -1,0 +1,63 @@
+name: "lvface"
+      platform: "onnxruntime_onnx"
+      max_batch_size: 128
+
+      input [
+        {
+          name: "INPUT__0"
+          data_type: TYPE_FP32
+          format: FORMAT_NCHW
+          dims: [ 3, 112, 112 ]
+        }
+      ]
+
+      output [
+        {
+  name: "LIVENESS__0"
+  data_type: TYPE_FP32
+  dims: [ 2 ]
+},
+        {
+  name: "EMBEDDING__1"
+  data_type: TYPE_FP32
+  dims: [ 512 ]
+}
+      ]
+
+      instance_group [
+        {
+          count: 2
+          kind: KIND_GPU
+          gpus: [ 0 ]
+        }
+      ]
+
+      dynamic_batching {
+        preferred_batch_size: [ 16, 32, 64, 128 ]
+        max_queue_delay_microseconds: 2500
+        preserve_ordering: true
+        default_queue_policy {
+          timeout_action: REJECT
+          default_timeout_microseconds: 12000
+          allow_timeout_override: false
+          max_queue_size: 4096
+        }
+      }
+
+      optimization {
+        execution_accelerators {
+          gpu_execution_accelerator: [
+            {
+              name: "tensorrt"
+              parameters { key: "precision_mode" value: "FP16" }
+              parameters { key: "max_workspace_size_bytes" value: "2147483648" }
+            }
+          ]
+        }
+      }
+
+      version_policy: {
+        latest {
+          num_versions: 2
+        }
+      }

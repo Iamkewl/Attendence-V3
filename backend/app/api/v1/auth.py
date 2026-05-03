@@ -1,0 +1,365 @@
+"""Authentication endpoints for login, refresh rotation, and logout workflows."""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from typing import Annotated
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import CurrentUser
+from app.core.database import get_async_session
+from app.core.pubsub import RedisPubSubManager, WS_TICKET_TTL_SECONDS
+from app.core.security import (
+    SecurityError,
+    TokenClaims,
+    TokenType,
+    blocklist_token,
+    create_access_token,
+    create_refresh_token,
+    get_security_settings,
+    validate_token,
+    verify_password,
+)
+from app.domain.models import User, UserRole
+
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+PasswordStr = Annotated[str, StringConstraints(min_length=8, max_length=128)]
+
+
+class AuthUserRead(BaseModel):
+    """Response schema exposing safe, non-sensitive user session information."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    email: EmailStr
+    full_name: str
+    role: UserRole
+
+
+class LoginRequest(BaseModel):
+    """Credential payload used to establish an authenticated session."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    email: EmailStr
+    password: PasswordStr
+
+
+class SessionResponse(BaseModel):
+    """Session response returned after login or refresh operations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user: AuthUserRead
+    access_token_expires_at: datetime = Field(
+        description="UTC timestamp when the active access token expires."
+    )
+
+
+class LogoutResponse(BaseModel):
+    """Result payload confirming logout completion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+
+
+class WebSocketTicketResponse(BaseModel):
+    """One-time ticket payload consumed by realtime websocket and SSE endpoints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticket: UUID
+    expires_in_seconds: Annotated[int, Field(gt=0)]
+
+
+def _seconds_until(expires_at: datetime) -> int:
+    """Compute non-zero lifetime for cookie max-age and expiration fields."""
+    return max(int((expires_at - datetime.now(tz=UTC)).total_seconds()), 1)
+
+
+def _set_auth_cookies(
+    response: Response,
+    *,
+    access_token: str,
+    access_claims: TokenClaims,
+    refresh_token: str,
+    refresh_claims: TokenClaims,
+) -> None:
+    """Set secure HttpOnly auth cookies for access and refresh token values."""
+    settings = get_security_settings()
+
+    access_max_age = _seconds_until(access_claims.expires_at)
+    refresh_max_age = _seconds_until(refresh_claims.expires_at)
+
+    cookie_base_kwargs: dict[str, int | str | bool] = {
+        "httponly": True,
+        "secure": True,
+        "samesite": "lax",
+    }
+
+    if settings.cookie_domain is not None:
+        cookie_base_kwargs["domain"] = settings.cookie_domain
+
+    response.set_cookie(
+        key=settings.access_cookie_name,
+        value=access_token,
+        path="/",
+        max_age=access_max_age,
+        expires=access_max_age,
+        **cookie_base_kwargs,
+    )
+    response.set_cookie(
+        key=settings.refresh_cookie_name,
+        value=refresh_token,
+        path="/api/v1/auth",
+        max_age=refresh_max_age,
+        expires=refresh_max_age,
+        **cookie_base_kwargs,
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    """Clear authentication cookies at the end of a session lifecycle."""
+    settings = get_security_settings()
+    delete_kwargs: dict[str, str] = {}
+    if settings.cookie_domain is not None:
+        delete_kwargs["domain"] = settings.cookie_domain
+
+    response.delete_cookie(settings.access_cookie_name, path="/", **delete_kwargs)
+    response.delete_cookie(settings.refresh_cookie_name, path="/api/v1/auth", **delete_kwargs)
+
+
+def _to_auth_user(user: User) -> AuthUserRead:
+    """Map ORM user object to safe response DTO."""
+    return AuthUserRead(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role,
+    )
+
+
+async def _resolve_user_by_id(session: AsyncSession, user_id: UUID) -> User | None:
+    """Load user entity by immutable identifier."""
+    return (
+        await session.execute(
+            select(User).where(User.id == user_id),
+        )
+    ).scalar_one_or_none()
+
+
+async def _revoke_token_if_valid(token: str | None, expected_type: TokenType, reason: str) -> None:
+    """Attempt revocation on provided token while tolerating malformed or expired values."""
+    if token is None or not token.strip():
+        return
+
+    try:
+        claims = await validate_token(token.strip(), expected_token_type=expected_type)
+    except SecurityError:
+        return
+
+    await blocklist_token(jti=claims.jti, expires_at=claims.expires_at, reason=reason)
+
+
+@router.post(
+    "/login",
+    response_model=SessionResponse,
+    summary="Authenticate User",
+    description="Authenticate user credentials and issue secure HttpOnly session cookies.",
+)
+async def login(
+    payload: LoginRequest,
+    response: Response,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> SessionResponse:
+    """Validate credentials, rotate auth cookies, and return authenticated user context."""
+    normalized_email = payload.email.lower()
+    user = (
+        await session.execute(
+            select(User).where(func.lower(User.email) == normalized_email),
+        )
+    ).scalar_one_or_none()
+
+    if user is None or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive.",
+        )
+
+    user.last_login_at = datetime.now(tz=UTC)
+
+    access_token, access_claims = create_access_token(subject=user.id, role=user.role)
+    refresh_token, refresh_claims = create_refresh_token(subject=user.id, role=user.role)
+
+    await session.commit()
+
+    _set_auth_cookies(
+        response,
+        access_token=access_token,
+        access_claims=access_claims,
+        refresh_token=refresh_token,
+        refresh_claims=refresh_claims,
+    )
+
+    return SessionResponse(
+        user=_to_auth_user(user),
+        access_token_expires_at=access_claims.expires_at,
+    )
+
+
+@router.post(
+    "/refresh",
+    response_model=SessionResponse,
+    summary="Refresh Session",
+    description="Rotate refresh token and issue a new secure session cookie set.",
+)
+async def refresh_session(
+    request: Request,
+    response: Response,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> SessionResponse:
+    """Rotate refresh token using Redis-backed revocation checks and secure cookies."""
+    settings = get_security_settings()
+    raw_refresh_token = request.cookies.get(settings.refresh_cookie_name)
+
+    if raw_refresh_token is None or not raw_refresh_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token cookie is missing.",
+        )
+
+    try:
+        refresh_claims = await validate_token(
+            raw_refresh_token.strip(),
+            expected_token_type="refresh",
+        )
+    except SecurityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token is invalid or expired.",
+        ) from exc
+
+    user = await _resolve_user_by_id(session, refresh_claims.sub)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authenticated user does not exist.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive.",
+        )
+
+    revoked = await blocklist_token(
+        jti=refresh_claims.jti,
+        expires_at=refresh_claims.expires_at,
+        reason="refresh_rotation",
+        only_if_absent=True,
+    )
+
+    if not revoked:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has already been used.",
+        )
+
+    new_access_token, new_access_claims = create_access_token(subject=user.id, role=user.role)
+    new_refresh_token, new_refresh_claims = create_refresh_token(subject=user.id, role=user.role)
+
+    _set_auth_cookies(
+        response,
+        access_token=new_access_token,
+        access_claims=new_access_claims,
+        refresh_token=new_refresh_token,
+        refresh_claims=new_refresh_claims,
+    )
+
+    return SessionResponse(
+        user=_to_auth_user(user),
+        access_token_expires_at=new_access_claims.expires_at,
+    )
+
+
+@router.post(
+    "/ws-ticket",
+    response_model=WebSocketTicketResponse,
+    summary="Issue Realtime Ticket",
+    description=(
+        "Issue a one-time ticket for authenticated websocket/SSE upgrades. "
+        "The ticket expires quickly and is invalidated after first successful use."
+    ),
+)
+async def issue_websocket_ticket(current_user: CurrentUser) -> WebSocketTicketResponse:
+    """Create a short-lived one-time realtime ticket for the authenticated user."""
+    pubsub_manager = RedisPubSubManager()
+    payload = json.dumps(
+        {
+            "user_id": str(current_user.id),
+            "issued_at": datetime.now(tz=UTC).isoformat(),
+        },
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+    for _ in range(5):
+        ticket = uuid4()
+        issued = await pubsub_manager.issue_ticket(
+            str(ticket),
+            payload=payload,
+            ttl_seconds=WS_TICKET_TTL_SECONDS,
+        )
+        if issued:
+            return WebSocketTicketResponse(
+                ticket=ticket,
+                expires_in_seconds=WS_TICKET_TTL_SECONDS,
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Failed to issue websocket ticket. Please retry.",
+    )
+
+
+@router.post(
+    "/logout",
+    response_model=LogoutResponse,
+    summary="Logout User",
+    description="Revoke active tokens and clear authentication cookies.",
+)
+async def logout(request: Request, response: Response) -> LogoutResponse:
+    """Best-effort token revocation followed by deterministic cookie invalidation."""
+    settings = get_security_settings()
+
+    await _revoke_token_if_valid(
+        token=request.cookies.get(settings.access_cookie_name),
+        expected_type="access",
+        reason="logout",
+    )
+    await _revoke_token_if_valid(
+        token=request.cookies.get(settings.refresh_cookie_name),
+        expected_type="refresh",
+        reason="logout",
+    )
+
+    _clear_auth_cookies(response)
+
+    return LogoutResponse(message="Logout successful.")
