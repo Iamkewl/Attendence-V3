@@ -1,16 +1,39 @@
-# React + Vite
+# Attendance V3 — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite single-page app for the Attendance V3 system. Talks to the
+FastAPI backend via REST + WebSockets/SSE for live updates.
 
-Currently, two official plugins are available:
+## Local development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Backend must be running first (see the top-level [README.md](../README.md)
+or run `..\scripts\Start-LocalDev.ps1` from the repo root). Then:
 
-## React Compiler
+```powershell
+npm install
+npm run dev
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The Vite dev server starts on `http://localhost:5173` with `/api` and `/ws`
+proxied to `http://localhost:8000` (see `vite.config.js`).
 
-## Expanding the ESLint configuration
+## Scripts
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+| Command | What it does |
+|---|---|
+| `npm run dev` | Vite dev server with HMR on port 5173 |
+| `npm run build` | Production build into `dist/` |
+| `npm run preview` | Serve the production build locally |
+| `npm run lint` | Run ESLint over the codebase |
+
+## Stack
+
+- **React 19** + **Vite 8** + **Tailwind CSS 4**
+- **react-router-dom** for routing
+- **axios** for HTTP, **lucide-react** for icons
+- ESLint with `@eslint/js`, `eslint-plugin-react-hooks`, and `eslint-plugin-react-refresh`
+
+## CI
+
+PRs touching `frontend/**` automatically run ESLint and a Vite build via
+`.github/workflows/ci.yml` (the `frontend` job). Both must pass before
+merge. See [../CLAUDE.md](../CLAUDE.md) for the agent PR protocol.
