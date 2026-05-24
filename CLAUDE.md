@@ -130,8 +130,20 @@ When a scheduled run reports FAIL, the workflow opens an issue labeled
 `nightly-drift` with the run URL and triage steps. Manual trigger via
 `gh workflow run nightly-inference.yml`.
 
-Iterate on the kernel locally with `scripts/Push-KaggleKernel.ps1 -Watch`
-(needs `KAGGLE_USERNAME` env var and `~/.kaggle/kaggle.json` set up).
+First-time setup (after adding `KAGGLE_USERNAME` + `KAGGLE_KEY` repo
+secrets and dropping `kaggle.json` at `~/.kaggle/`):
+
+```powershell
+$env:KAGGLE_USERNAME = "<your-handle>"
+.\scripts\Initialize-KaggleResources.ps1
+```
+
+That one command stages model files, creates both private Kaggle Datasets
+(models + baselines), pushes the kernel, waits for the first run, and
+prints the exact PR command to commit the resulting baseline JSON.
+Idempotent — safe to re-run after a partial failure.
+
+Iterate on the kernel later with `scripts/Push-KaggleKernel.ps1 -Watch`.
 
 ---
 
