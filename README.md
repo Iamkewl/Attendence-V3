@@ -15,6 +15,7 @@ It is intentionally separated from the agent control plane.
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — system design, request flow, key abstractions, and the test-seam pattern for Triton.
 - [RUNBOOK.md](./RUNBOOK.md) — operational procedures: starting/stopping services, common troubleshooting, demo mode.
+- [CLAUDE.md](./CLAUDE.md) — agent collaboration rules: branching, PR labels, auto-merge gates.
 
 ## Repository Layout
 
