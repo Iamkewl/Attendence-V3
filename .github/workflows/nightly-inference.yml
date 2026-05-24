@@ -1,0 +1,217 @@
+name: Nightly Kaggle inference regression
+
+on:
+  # 04:00 UTC daily = 09:30 IST. Trigger off-peak for the Kaggle GPU queue.
+  schedule:
+    - cron: "0 4 * * *"
+  # Manual trigger for ad-hoc runs and bootstrap.
+  workflow_dispatch:
+    inputs:
+      skip_baseline_sync:
+        description: "Skip the baseline dataset sync (use existing Kaggle version)"
+        required: false
+        default: "false"
+
+# Only one nightly at a time.
+concurrency:
+  group: nightly-inference
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write   # for opening drift-report issues when needed
+
+jobs:
+  push-and-wait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Kaggle CLI
+        run: pip install "kaggle>=1.6.0,<2.0.0"
+
+      - name: Materialize ~/.kaggle/kaggle.json from secrets
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.kaggle
+          # Kaggle CLI reads KAGGLE_USERNAME / KAGGLE_KEY from env first; this
+          # file is a belt-and-suspenders fallback used by some code paths.
+          cat > ~/.kaggle/kaggle.json <<EOF
+          {"username":"${KAGGLE_USERNAME}","key":"${KAGGLE_KEY}"}
+          EOF
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Verify Kaggle auth
+        run: kaggle config view
+
+      # -----------------------------------------------------------------
+      # Sync the baselines dataset from tests/inference_baseline.json so
+      # the kernel sees whatever was most recently committed.
+      # -----------------------------------------------------------------
+      - name: Sync baselines dataset
+        if: ${{ github.event.inputs.skip_baseline_sync != 'true' }}
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          # Substitute username into the metadata template
+          sed "s|KAGGLE_USERNAME|${KAGGLE_USERNAME}|g" \
+              infra/kaggle_baselines/dataset-metadata.json > "$TMP/dataset-metadata.json"
+          cp tests/inference_baseline.json "$TMP/inference_baseline.json"
+
+          # First-time create vs version bump
+          if kaggle datasets status "${KAGGLE_USERNAME}/attendence-v3-baselines" > /dev/null 2>&1; then
+            echo "Baselines dataset exists; bumping version."
+            # No-changes is a benign error we tolerate.
+            if ! kaggle datasets version -p "$TMP" -m "Sync from main @ ${GITHUB_SHA::8}" 2>&1 | tee /tmp/datasets-output; then
+              if grep -qE "(no changes|No files to upload)" /tmp/datasets-output; then
+                echo "(baseline unchanged; skipping version bump)"
+              else
+                echo "Dataset version bump failed unexpectedly." >&2
+                exit 1
+              fi
+            fi
+          else
+            echo "Baselines dataset doesn't exist; creating ..."
+            kaggle datasets create -p "$TMP"
+          fi
+
+      # -----------------------------------------------------------------
+      # Materialize the kernel directory with username substitution.
+      # -----------------------------------------------------------------
+      - name: Prepare kernel push directory
+        id: prepare
+        run: |
+          set -euo pipefail
+          KERNEL_DIR=$(mktemp -d)
+          sed "s|KAGGLE_USERNAME|${KAGGLE_USERNAME}|g" \
+              notebooks/kernel-metadata.json > "$KERNEL_DIR/kernel-metadata.json"
+          cp notebooks/nightly_inference.py "$KERNEL_DIR/nightly_inference.py"
+          echo "kernel_dir=$KERNEL_DIR" >> "$GITHUB_OUTPUT"
+          echo "kernel_slug=${KAGGLE_USERNAME}/attendence-v3-nightly-inference" >> "$GITHUB_OUTPUT"
+
+      - name: Push kernel to Kaggle
+        env:
+          KERNEL_DIR: ${{ steps.prepare.outputs.kernel_dir }}
+        run: kaggle kernels push -p "$KERNEL_DIR"
+
+      # -----------------------------------------------------------------
+      # Poll status up to 30 min. Free-tier Kaggle T4 typically queues for
+      # ~1 min then runs in ~2 min, so this is generous.
+      # -----------------------------------------------------------------
+      - name: Wait for kernel to finish
+        id: wait
+        env:
+          KERNEL_SLUG: ${{ steps.prepare.outputs.kernel_slug }}
+        run: |
+          set -euo pipefail
+          MAX_ITER=60   # 60 * 30s = 30 min
+          for i in $(seq 1 $MAX_ITER); do
+            sleep 30
+            STATUS_LINE=$(kaggle kernels status "$KERNEL_SLUG" 2>&1)
+            echo "[$i/$MAX_ITER] $STATUS_LINE"
+            if echo "$STATUS_LINE" | grep -q 'has status "complete"'; then
+              echo "terminal=complete" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if echo "$STATUS_LINE" | grep -q 'has status "error"'; then
+              echo "terminal=error" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            if echo "$STATUS_LINE" | grep -qE 'has status "cancel(Acknowledged|Requested)"'; then
+              echo "terminal=cancelled" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          done
+          echo "Timed out after $((MAX_ITER * 30 / 60)) min."
+          echo "terminal=timeout" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      # -----------------------------------------------------------------
+      # Download outputs even on prior step failure for diagnostics.
+      # -----------------------------------------------------------------
+      - name: Download kernel outputs
+        if: always()
+        env:
+          KERNEL_SLUG: ${{ steps.prepare.outputs.kernel_slug }}
+        run: |
+          mkdir -p kaggle-output
+          kaggle kernels output "$KERNEL_SLUG" -p kaggle-output || echo "Output download failed; continuing."
+          ls -la kaggle-output/ || true
+
+      - name: Upload outputs as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-nightly-${{ github.run_number }}
+          path: kaggle-output/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # -----------------------------------------------------------------
+      # Parse the report and fail the workflow if the kernel reported FAIL.
+      # -----------------------------------------------------------------
+      - name: Parse report and gate
+        id: gate
+        if: always()
+        run: |
+          set -euo pipefail
+          REPORT=kaggle-output/inference_current.json
+          if [ ! -f "$REPORT" ]; then
+            echo "Report file not found at $REPORT" >&2
+            echo "status=MISSING_REPORT" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          STATUS=$(python -c "import json,sys; print(json.load(open('$REPORT'))['status'])")
+          echo "Kernel reported status: $STATUS"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          case "$STATUS" in
+            PASS|BASELINE_GENERATED) exit 0 ;;
+            FAIL) echo "Drift detected. See artifact for details." >&2 ; exit 1 ;;
+            *) echo "Unexpected status '$STATUS'." >&2 ; exit 1 ;;
+          esac
+
+      # -----------------------------------------------------------------
+      # Open a drift issue on FAIL (scheduled runs only; not for manual
+      # dispatch where the operator is already looking at the run).
+      # -----------------------------------------------------------------
+      - name: Open drift issue (scheduled runs only)
+        if: failure() && github.event_name == 'schedule' && steps.gate.outputs.status == 'FAIL'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `## Nightly inference drift detected`,
+              ``,
+              `The Kaggle nightly inference kernel reported \`FAIL\` against the committed baseline.`,
+              ``,
+              `- **Run:** ${runUrl}`,
+              `- **Run number:** ${context.runNumber}`,
+              `- **Triggered:** ${context.eventName}`,
+              ``,
+              `### Next steps`,
+              `1. Download the \`kaggle-nightly-${context.runNumber}\` artifact from the run page.`,
+              `2. Inspect \`inference_current.json\` -> \`comparison.checks\` for the failing tests.`,
+              `3. If the drift is legitimate (e.g. model was updated), accept it by copying \`inference_current.json\` over \`tests/inference_baseline.json\` and committing.`,
+              `4. If the drift is unexpected, investigate before accepting.`,
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `nightly-inference: drift detected (run #${context.runNumber})`,
+              body,
+              labels: ['nightly-drift']
+            });

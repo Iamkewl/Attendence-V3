@@ -57,3 +57,6 @@ celerybeat-schedule*
 # graphify-mcp generated graph analysis (regenerable)
 graphify-out/
 
+# Kaggle kernel output snapshots (downloaded by scripts/Push-KaggleKernel.ps1)
+.kaggle-output/
+kaggle-output/
