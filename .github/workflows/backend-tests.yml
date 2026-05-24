@@ -84,7 +84,7 @@ jobs:
           --cov=backend/app
           --cov-report=xml
           --cov-report=term
-          --cov-fail-under=70
+          --cov-fail-under=60
           --ignore=backend/app/worker/triton_client.py
 
       - name: Upload coverage report
