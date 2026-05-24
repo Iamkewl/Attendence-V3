@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ["main", "master"]
+  push:
+    branches: ["main", "master"]
+
+# A second event on the same PR (e.g. a new push) supersedes the running job.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # changes: compute booleans for which sub-trees the PR/push touches. Downstream
+  # jobs gate on these so a docs-only PR doesn't pay for a node_modules install.
+  # ---------------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      # On pull_request events, dorny/paths-filter queries the API for the diff
+      # between base and head SHAs; checkout is unnecessary. On push events it
+      # falls back to git, so we provide a fetch-depth=2 checkout for that path.
+      - name: Checkout (push only)
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed paths
+        # Pin to major tag for now; consider SHA pinning for stricter supply
+        # chain hygiene (e.g. dorny/paths-filter@<sha>).
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - 'pyproject.toml'
+            frontend:
+              - 'frontend/**'
+
+  # ---------------------------------------------------------------------------
+  # lint: Ruff pyflakes-equivalent (--select=F) over the backend tree. We start
+  # with the "real bugs" ruleset only; style rules can be ratcheted in later.
+  # The job ALWAYS runs and ALWAYS reports a check so branch protection's
+  # "required" gate is always satisfied -- the work inside is what's gated.
+  # ---------------------------------------------------------------------------
+  lint:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        if: needs.changes.outputs.backend == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        if: needs.changes.outputs.backend == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ruff
+        if: needs.changes.outputs.backend == 'true'
+        run: pip install "ruff>=0.11.10,<1.0.0"
+
+      - name: Ruff check (real bugs only)
+        if: needs.changes.outputs.backend == 'true'
+        run: ruff check --select=F --output-format=github backend
+
+      - name: Skipped (no backend changes)
+        if: needs.changes.outputs.backend != 'true'
+        run: echo "No backend changes -- lint skipped (passing trivially)."
+
+  # ---------------------------------------------------------------------------
+  # frontend: ESLint + Vite build. npm ci is gated on the lockfile being
+  # present, which is enforced by check-in. Always reports a check.
+  # ---------------------------------------------------------------------------
+  frontend:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        if: needs.changes.outputs.frontend == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies (clean)
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: frontend
+        run: npm ci
+
+      - name: ESLint
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Vite build
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: frontend
+        run: npm run build
+
+      - name: Skipped (no frontend changes)
+        if: needs.changes.outputs.frontend != 'true'
+        run: echo "No frontend changes -- checks skipped (passing trivially)."
