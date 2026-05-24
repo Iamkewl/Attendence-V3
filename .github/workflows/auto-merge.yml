@@ -1,0 +1,88 @@
+name: Auto-merge agent PRs
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+
+# We only need to evaluate the latest state of each PR. If a second event
+# fires for the same PR while we're still running, cancel the older job.
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  evaluate:
+    # Skip drafts entirely.
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate — require agent-pr label
+        id: label-gate
+        run: |
+          labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          echo "Labels: $labels"
+          if echo "$labels" | grep -q '"do-not-merge"'; then
+            echo "PR carries do-not-merge label — refusing." >&2
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! echo "$labels" | grep -q '"agent-pr"'; then
+            echo "PR is not labeled agent-pr — skipping auto-merge." >&2
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "should_merge=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head (sparse, to inspect changed paths)
+        if: steps.label-gate.outputs.should_merge == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Gate — refuse if PR touches protected paths
+        if: steps.label-gate.outputs.should_merge == 'true'
+        id: path-gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "Changed files:"
+          echo "$changed"
+          # Any change under .github/, CODEOWNERS, alembic, deps manifests,
+          # scripts/, infra/, or compose files = human review required.
+          if echo "$changed" | grep -E '^(\.github/|backend/alembic|backend/alembic\.ini|pyproject\.toml|frontend/package(-lock)?\.json|scripts/|infra/|docker-compose\.dev\.yml|CODEOWNERS)' > /dev/null; then
+            echo "PR modifies a CODEOWNERS-protected path. Refusing to auto-merge." >&2
+            echo "should_merge=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "should_merge=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App installation token
+        if: steps.path-gate.outputs.should_merge == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AUTOMERGER_APP_ID }}
+          private-key: ${{ secrets.AUTOMERGER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Enable auto-merge (squash) on PR
+        if: steps.path-gate.outputs.should_merge == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # --auto tells GitHub: merge when all required checks are green
+          # and all required reviews are in. If the PR is already mergeable,
+          # GitHub merges immediately.
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch

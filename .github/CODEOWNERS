@@ -1,2 +1,27 @@
-# Code owners for Attendance v3 project
-* @DELL
+# CODEOWNERS — paths that require Suryaansh's review even on agent PRs.
+# Auto-merge will refuse to fire for any PR whose diff touches these paths.
+#
+# Syntax: <pattern> <owner1> [<owner2> ...]
+# Patterns follow .gitignore rules. Last matching pattern wins.
+
+# Default: no required owner. Branch protection's "require code owner review"
+# only kicks in for paths matched below.
+
+# CI, automation, and repo governance — humans only.
+/.github/                   @Iamkewl
+/.github/CODEOWNERS         @Iamkewl
+/.github/workflows/         @Iamkewl
+
+# Database migrations — schema changes need a human eye.
+/backend/alembic/           @Iamkewl
+/backend/alembic.ini        @Iamkewl
+
+# Dependency manifests — supply-chain surface.
+/pyproject.toml             @Iamkewl
+/frontend/package.json      @Iamkewl
+/frontend/package-lock.json @Iamkewl
+
+# Deploy and infra scripts — operational risk.
+/scripts/                   @Iamkewl
+/infra/                     @Iamkewl
+/docker-compose.dev.yml     @Iamkewl
