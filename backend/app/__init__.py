@@ -1,1 +1,1 @@
-"""Application package for the V2 Attendance backend service."""
+"""Application package for the Attendance V3 backend service."""
