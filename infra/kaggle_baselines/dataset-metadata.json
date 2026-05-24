@@ -1,0 +1,9 @@
+{
+  "title": "Attendence V3 Inference Baselines",
+  "id": "KAGGLE_USERNAME/attendence-v3-baselines",
+  "licenses": [{"name": "CC0-1.0"}],
+  "subtitle": "Frozen baseline JSON for the nightly inference regression check",
+  "description": "Tiny private dataset holding the committed inference baseline JSON. Updated by the nightly workflow from tests/inference_baseline.json on each run.",
+  "isPrivate": true,
+  "keywords": ["attendence-v3", "regression", "baseline"]
+}

@@ -1,0 +1,9 @@
+{
+  "title": "Attendence V3 Models",
+  "id": "KAGGLE_USERNAME/attendence-v3-models",
+  "licenses": [{"name": "CC0-1.0"}],
+  "subtitle": "YOLOv12 + LVFace ONNX models for Attendence V3 nightly inference checks",
+  "description": "Private dataset containing the production ONNX models used by the Attendence V3 inference pipeline. Consumed by the nightly Kaggle kernel that runs regression checks against a committed baseline. Update via: kaggle datasets version -p infra/kaggle_dataset -m 'reason for new version'",
+  "isPrivate": true,
+  "keywords": ["attendence-v3", "yolo", "lvface", "onnx"]
+}

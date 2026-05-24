@@ -109,6 +109,32 @@ before opening a PR — CI is the gate, not the discovery mechanism.
 
 ---
 
+## Nightly inference regression (Kaggle)
+
+The production GPU server is the source of truth for inference. As a
+backup safety net for when it's offline, `.github/workflows/nightly-inference.yml`
+runs the YOLOv12 + LVFace models on a Kaggle T4 daily at 04:00 UTC and
+compares outputs to `tests/inference_baseline.json` within tolerance.
+
+- Kernel script: `notebooks/nightly_inference.py`
+- Models live in a private Kaggle Dataset (`<user>/attendence-v3-models`),
+  seeded once via `infra/kaggle_dataset/`. See its README for upload steps.
+- Baseline JSON is synced from the repo on every workflow run via the
+  small `<user>/attendence-v3-baselines` dataset.
+- Drift detection layers:
+  1. Model file sha256 changed → loud fail.
+  2. Output tensor sha256 mismatch → check stats drift.
+  3. Stats drift > `1e-4` → fail. Otherwise PASS (acceptable CUDA noise).
+
+When a scheduled run reports FAIL, the workflow opens an issue labeled
+`nightly-drift` with the run URL and triage steps. Manual trigger via
+`gh workflow run nightly-inference.yml`.
+
+Iterate on the kernel locally with `scripts/Push-KaggleKernel.ps1 -Watch`
+(needs `KAGGLE_USERNAME` env var and `~/.kaggle/kaggle.json` set up).
+
+---
+
 ## What NOT to do
 
 - Do not push directly to `main`. (You can't — branch protection rejects it.)
