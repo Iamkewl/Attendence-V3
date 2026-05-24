@@ -29,6 +29,23 @@ The `main` branch is protected:
 5. If anything looks risky, also apply `do-not-merge` — this overrides the
    `agent-pr` label and forces manual review.
 
+### Shortcut: one command does steps 1–5
+
+The user-scope script `New-AgentPR.ps1` (at `C:\Users\DELL\.agents\scripts\`)
+packages an entire dirty working tree into a labeled agent PR. From the
+repo root with uncommitted changes:
+
+```powershell
+powershell -File C:\Users\DELL\.agents\scripts\New-AgentPR.ps1 `
+    -Slug fix-something -Title "area: short imperative subject" `
+    -AgentName Claude -ModelName "Claude Opus 4.7"
+```
+
+It cuts `agent/fix-something` from current state, commits with the right
+Co-Authored-By trailer, pushes, opens the PR, and applies the `agent-pr`
+label. Add `-DryRun` to see the plan without touching git. Add `-NoLabel`
+when the PR is expected to need manual review (e.g. touches CI files).
+
 ### What auto-merge will refuse
 
 The `.github/workflows/auto-merge.yml` guard refuses to enable auto-merge if
