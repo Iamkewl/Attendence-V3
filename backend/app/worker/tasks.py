@@ -22,7 +22,7 @@ from app.services.attendance_service import (
 )
 from app.services.pipeline_service import process_inference_batch
 from app.worker.celery_app import celery_app
-from app.worker.triton_client import (
+from app.infrastructure.triton import (
     TritonInferenceError,
     TritonModelUnavailableError,
     TritonServerUnavailableError,
@@ -137,20 +137,23 @@ async def _evaluate_daily_attendance(required_sightings_threshold: int) -> dict[
     }
 
     session_factory = get_session_factory()
+
     async with session_factory() as session:
         course_ids = await _select_scheduled_active_course_ids(session, target_date=current_date)
-        summary["scheduled_active_courses"] = len(course_ids)
 
-        if not course_ids:
-            return summary
+    summary["scheduled_active_courses"] = len(course_ids)
 
-        attendance_service = AttendanceService(session=session)
-        failed_course_ids: list[str] = []
-        courses_evaluated = 0
-        records_upserted = 0
+    if not course_ids:
+        return summary
 
-        for course_id in course_ids:
+    failed_course_ids: list[str] = []
+    courses_evaluated = 0
+    records_upserted = 0
+
+    for course_id in course_ids:
+        async with session_factory() as session:
             try:
+                attendance_service = AttendanceService(session=session)
                 updated_records = await attendance_service.evaluate_class_attendance(
                     course_id=course_id,
                     date=current_date,
@@ -159,7 +162,6 @@ async def _evaluate_daily_attendance(required_sightings_threshold: int) -> dict[
                 courses_evaluated += 1
                 records_upserted += len(updated_records)
             except (AttendanceNotFoundError, AttendanceValidationError) as exc:
-                await session.rollback()
                 failed_course_ids.append(str(course_id))
                 LOGGER.warning(
                     "Skipping attendance evaluation for course_id=%s date=%s due to validation error: %s",
@@ -168,7 +170,6 @@ async def _evaluate_daily_attendance(required_sightings_threshold: int) -> dict[
                     exc,
                 )
             except Exception:
-                await session.rollback()
                 failed_course_ids.append(str(course_id))
                 LOGGER.exception(
                     "Unexpected failure while evaluating attendance for course_id=%s date=%s.",
@@ -176,10 +177,10 @@ async def _evaluate_daily_attendance(required_sightings_threshold: int) -> dict[
                     current_date.isoformat(),
                 )
 
-        summary["courses_evaluated"] = courses_evaluated
-        summary["courses_failed"] = len(failed_course_ids)
-        summary["records_upserted"] = records_upserted
-        summary["failed_course_ids"] = failed_course_ids
+    summary["courses_evaluated"] = courses_evaluated
+    summary["courses_failed"] = len(failed_course_ids)
+    summary["records_upserted"] = records_upserted
+    summary["failed_course_ids"] = failed_course_ids
 
     return summary
 
@@ -239,6 +240,29 @@ async def _log_pipeline_sightings(
     return logged_sightings
 
 
+async def _run_pipeline_and_log_sightings(
+    request: InferenceBatchRequest,
+) -> dict[str, Any]:
+    """Run the inference pipeline and persist sightings in one event loop.
+
+    Why: invoking `asyncio.run()` twice per Celery task creates two independent
+    event loops; the asyncpg engine cached by `get_session_factory()` binds to
+    the first loop and breaks when the second loop tries to reuse it.
+    Sighting-log failures are deliberately swallowed (return 0) so they cannot
+    trigger a Celery retry of a pipeline that already succeeded.
+    """
+    pipeline_result = await process_inference_batch(request)
+
+    try:
+        sightings_logged = await _log_pipeline_sightings(request, pipeline_result)
+    except Exception:
+        LOGGER.exception("Failed to persist heartbeat sightings during pipeline run.")
+        sightings_logged = 0
+
+    pipeline_result["sightings_logged"] = sightings_logged
+    return pipeline_result
+
+
 @celery_app.task(
     bind=True,
     name="app.worker.tasks.run_inference_pipeline",
@@ -262,7 +286,7 @@ def run_inference_pipeline(self, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Inference payload validation failed.") from exc
 
     try:
-        pipeline_result = asyncio.run(process_inference_batch(request))
+        pipeline_result = asyncio.run(_run_pipeline_and_log_sightings(request))
     except (
         TritonTimeoutError,
         TritonServerUnavailableError,
@@ -275,13 +299,6 @@ def run_inference_pipeline(self, payload: dict[str, Any]) -> dict[str, Any]:
         LOGGER.exception("Non-retryable pipeline failure while processing task %s.", self.request.id)
         raise RuntimeError("Inference pipeline execution failed.") from exc
 
-    try:
-        logged_sightings = asyncio.run(_log_pipeline_sightings(request, pipeline_result))
-    except Exception:
-        LOGGER.exception("Failed to persist heartbeat sightings for task %s.", self.request.id)
-        logged_sightings = 0
-
-    pipeline_result["sightings_logged"] = logged_sightings
     pipeline_result["task_id"] = self.request.id
     pipeline_result["task_state"] = "SUCCESS"
     return pipeline_result
@@ -316,4 +333,22 @@ def task_evaluate_daily_attendance(
     return summary
 
 
-__all__ = ["run_inference_pipeline", "task_evaluate_daily_attendance"]
+@celery_app.task(bind=True, name="app.worker.tasks.demo_emit_sighting")
+def demo_emit_sighting(self) -> dict[str, Any]:
+    """Emit one synthetic sighting; gated on ATTENDANCE_DEMO_MODE."""
+    from app.worker.demo_emitter import _read_demo_flags, emit_one_synthetic_sighting
+
+    demo_mode, triton_demo, _, _ = _read_demo_flags()
+    if not (demo_mode and triton_demo):
+        return {"task_state": "SKIPPED", "reason": "demo mode disabled"}
+
+    try:
+        emitted = asyncio.run(emit_one_synthetic_sighting())
+    except Exception as exc:
+        LOGGER.exception("Demo sighting emission failed: %s", exc)
+        return {"task_state": "FAILURE", "error": str(exc)}
+
+    return {"task_state": "SUCCESS", "emitted": emitted}
+
+
+__all__ = ["demo_emit_sighting", "run_inference_pipeline", "task_evaluate_daily_attendance"]

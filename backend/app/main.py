@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.operations import router as operations_router
 from app.api.v1 import api_router, realtime_router
 from app.core.database import dispose_engine
+from app.core.middleware import AccessLogMiddleware, RequestIDMiddleware, configure_json_access_log
 from app.core.security import close_redis, initialize_redis
+
+
+_LOCALHOST_ORIGIN_PATTERN = re.compile(r"^http://localhost(:\d+)?$")
 
 
 def _parse_allowed_origins() -> list[str]:
@@ -29,10 +35,13 @@ def _parse_allowed_origins() -> list[str]:
         raise RuntimeError("Wildcard CORS origins are forbidden when credentials are enabled.")
 
     for origin in origins:
-        if not (origin.startswith("https://") or origin.startswith("http://localhost")):
-            raise RuntimeError(
-                "CORS origins must use HTTPS except for localhost development origins."
-            )
+        if origin.startswith("https://"):
+            continue
+        if _LOCALHOST_ORIGIN_PATTERN.fullmatch(origin):
+            continue
+        raise RuntimeError(
+            "CORS origins must use HTTPS except for http://localhost or http://localhost:<port>."
+        )
 
     return origins
 
@@ -59,6 +68,7 @@ def _content_security_policy() -> str:
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     """Initialize and tear down runtime resources used by auth and database layers."""
+    configure_json_access_log()
     await initialize_redis()
     try:
         yield
@@ -104,6 +114,9 @@ def create_app() -> FastAPI:
         max_age=600,
     )
 
+    app.add_middleware(AccessLogMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+
     @app.middleware("http")
     async def inject_security_headers(request: Request, call_next) -> Response:
         """Apply strict response headers to reduce browser-based attack surface."""
@@ -123,6 +136,7 @@ def create_app() -> FastAPI:
         """Lightweight service health endpoint for probes."""
         return {"status": "ok"}
 
+    app.include_router(operations_router)
     app.include_router(realtime_router)
     app.include_router(api_router, prefix="/api/v1")
     return app

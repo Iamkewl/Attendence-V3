@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.pubsub import LIVE_ATTENDANCE_CHANNEL, RedisPubSubManager
 from app.domain.models import AttendanceStatus, ClassSessionRecord, Course, Room, Sighting, Student
-from app.domain.schemas import ClassSessionRecordCreate, ClassSessionRecordUpdate
+from app.domain.schemas import ClassSessionListResponse, ClassSessionRecordCreate, ClassSessionRecordUpdate, ClassSessionRosterRecord
 from app.services.base import AsyncCRUDService
 
 
@@ -88,7 +88,16 @@ class AttendanceService(
                 )
             ).scalar_one()
 
-        await self._publish_live_sighting_event(created)
+        # Insert is committed. Publish is best-effort: a failure here must not
+        # propagate to the caller so that the persisted sighting is counted correctly.
+        try:
+            await self._publish_live_sighting_event(created)
+        except Exception:
+            LOGGER.exception(
+                "Live sighting publish failed after sighting %s was persisted.",
+                created.id,
+            )
+
         return created
 
     async def evaluate_class_attendance(
@@ -182,6 +191,92 @@ class AttendanceService(
             updated_records = list((await self.session.execute(upsert_stmt)).scalars().all())
 
         return updated_records
+
+    async def list_session_records(
+        self,
+        *,
+        course_id: UUID,
+        session_date: date,
+        default_threshold: int = 3,
+    ) -> ClassSessionListResponse:
+        """Return the attendance roster for one course on one day without triggering evaluation."""
+        await self._require_course(course_id)
+
+        existing_records = (
+            await self.session.execute(
+                select(ClassSessionRecord)
+                .where(ClassSessionRecord.course_id == course_id)
+                .where(ClassSessionRecord.session_date == session_date)
+            )
+        ).scalars().all()
+
+        if not existing_records:
+            return ClassSessionListResponse(
+                course_id=course_id,
+                session_date=session_date,
+                required_sightings_threshold=default_threshold,
+                records=[],
+            )
+
+        threshold = existing_records[0].required_sightings_threshold
+
+        student_ids = [r.student_id for r in existing_records]
+        student_rows = (
+            await self.session.execute(
+                select(Student.id, Student.user_id)
+                .where(Student.id.in_(student_ids))
+            )
+        ).all()
+        student_user_ids = {row.id: row.user_id for row in student_rows}
+
+        from app.domain.models import User as UserModel
+        user_rows = (
+            await self.session.execute(
+                select(UserModel.id, UserModel.full_name)
+                .where(UserModel.id.in_(student_user_ids.values()))
+            )
+        ).all()
+        user_full_names = {row.id: row.full_name for row in user_rows}
+
+        window_start = datetime.combine(session_date, time.min, tzinfo=UTC)
+        window_end = window_start + timedelta(days=1)
+        sighting_rows = (
+            await self.session.execute(
+                select(
+                    Sighting.student_id,
+                    func.count(Sighting.id).label("sighting_count"),
+                )
+                .where(Sighting.course_id == course_id)
+                .where(Sighting.timestamp >= window_start)
+                .where(Sighting.timestamp < window_end)
+                .where(Sighting.student_id.in_(student_ids))
+                .group_by(Sighting.student_id)
+            )
+        ).all()
+        sighting_counts = {row.student_id: int(row.sighting_count) for row in sighting_rows}
+
+        records: list[ClassSessionRosterRecord] = []
+        for record in existing_records:
+            user_id = student_user_ids.get(record.student_id)
+            full_name = user_full_names.get(user_id, "") if user_id is not None else ""
+            records.append(
+                ClassSessionRosterRecord(
+                    id=record.id,
+                    student_id=record.student_id,
+                    student_full_name=full_name,
+                    status=record.status.value,
+                    sightings_count=sighting_counts.get(record.student_id, 0),
+                    required_sightings_threshold=record.required_sightings_threshold,
+                    evaluated_at=record.evaluated_at,
+                )
+            )
+
+        return ClassSessionListResponse(
+            course_id=course_id,
+            session_date=session_date,
+            required_sightings_threshold=threshold,
+            records=records,
+        )
 
     async def _publish_live_sighting_event(self, sighting: Sighting) -> None:
         """Publish a serialized sighting payload to realtime subscribers."""
@@ -279,4 +374,5 @@ __all__ = [
     "AttendanceService",
     "AttendanceServiceError",
     "AttendanceValidationError",
+    "ClassSessionListResponse",
 ]

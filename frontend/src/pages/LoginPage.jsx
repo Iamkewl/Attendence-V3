@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { KeyRound } from 'lucide-react'
+import { KeyRound, ShieldCheck } from 'lucide-react'
 import { Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
 
@@ -18,16 +18,17 @@ export default function LoginPage() {
   const requestedPath =
     typeof location.state?.from === 'string' && location.state.from.length > 0
       ? location.state.from
-      : '/heartbeat-feed'
+      : '/dashboard'
 
-  const nextPath = requestedPath === '/login' ? '/heartbeat-feed' : requestedPath
+  const nextPath = requestedPath === '/login' ? '/dashboard' : requestedPath
 
   if (isLoading) {
     return (
       <div className="auth-screen">
         <div className="auth-card compact">
-          <h1>Attendance V2</h1>
-          <p>Checking session...</p>
+          <div className="auth-logo-mark" aria-hidden="true">A3</div>
+          <h1>Attendance V3</h1>
+          <p>Checking session…</p>
         </div>
       </div>
     )
@@ -40,6 +41,9 @@ export default function LoginPage() {
   const onInputChange = (event) => {
     const { name, value } = event.target
     setFormState((previous) => ({ ...previous, [name]: value }))
+    // Clear errors when user starts typing
+    if (formError) setFormError('')
+    if (authError) clearAuthError()
   }
 
   const onSubmit = async (event) => {
@@ -58,51 +62,83 @@ export default function LoginPage() {
     }
   }
 
+  const displayError = formError || authError
+
   return (
     <div className="auth-screen">
-      <form className="auth-card" onSubmit={onSubmit}>
-        <h1>Sign In</h1>
-        <p>Use your secure cookie-backed instructor account.</p>
+      <form className="auth-card" onSubmit={onSubmit} noValidate aria-label="Sign in form">
+        {/* Brand header */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          <div className="auth-logo-mark" aria-hidden="true">A3</div>
+          <div>
+            <h1>Sign in to Attendance V3</h1>
+            <p style={{ marginTop: '6px' }}>
+              Use your instructor credentials to access the dashboard.
+            </p>
+          </div>
+        </div>
 
+        <div className="auth-divider" />
+
+        {/* Form fields */}
         <div className="auth-form">
-          <label>
-            Email
+          <label htmlFor="login-email">
+            Email address
             <input
+              id="login-email"
               className="input-field"
               type="email"
               name="email"
               autoComplete="username"
               value={formState.email}
               onChange={onInputChange}
+              placeholder="instructor@example.edu"
               required
+              aria-required="true"
             />
           </label>
 
-          <label>
+          <label htmlFor="login-password">
             Password
             <input
+              id="login-password"
               className="input-field"
               type="password"
               name="password"
               autoComplete="current-password"
               value={formState.password}
               onChange={onInputChange}
+              placeholder="••••••••"
               required
+              aria-required="true"
               minLength={8}
             />
           </label>
         </div>
 
-        {formError || authError ? (
-          <div className="alert-banner" role="alert">
-            <span>{formError || authError}</span>
+        {/* Error banner */}
+        {displayError ? (
+          <div className="alert-banner" role="alert" aria-live="assertive">
+            <ShieldCheck size={15} aria-hidden="true" />
+            <span>{displayError}</span>
           </div>
         ) : null}
 
-        <button className="solid-btn" type="submit" disabled={isSubmitting}>
-          <KeyRound size={15} />
-          <span>{isSubmitting ? 'Signing In...' : 'Sign In'}</span>
+        {/* Submit */}
+        <button
+          className="solid-btn"
+          type="submit"
+          disabled={isSubmitting}
+          style={{ width: '100%', justifyContent: 'center', padding: '10px 14px' }}
+          aria-busy={isSubmitting}
+        >
+          <KeyRound size={15} aria-hidden="true" />
+          <span>{isSubmitting ? 'Signing in…' : 'Sign In'}</span>
         </button>
+
+        <p style={{ fontSize: '0.78rem', color: 'var(--text-subtle)', textAlign: 'center', marginTop: '-6px' }}>
+          Session is secured via HTTP-only cookies.
+        </p>
       </form>
     </div>
   )

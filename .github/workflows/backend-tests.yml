@@ -1,0 +1,95 @@
+name: Backend Tests
+
+on:
+  pull_request:
+    branches: ["main", "master"]
+  push:
+    branches: ["main", "master"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: attendance_test
+          POSTGRES_USER: attendance
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U attendance -d attendance_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      ATTENDANCE_DATABASE_URL: postgresql+asyncpg://attendance:testpassword@localhost:5432/attendance_test
+      ATTENDANCE_DATABASE_URL_TEST: postgresql+asyncpg://attendance:testpassword@localhost:5432/attendance_test
+      ATTENDANCE_REDIS_URL: redis://localhost:6379/0
+      ATTENDANCE_REDIS_URL_TEST: redis://localhost:6379/0
+      ATTENDANCE_JWT_SECRET: ci-test-secret-not-for-production-use-only
+      ATTENDANCE_ALLOWED_ORIGINS: http://localhost:5173
+      ATTENDANCE_TRITON_URL: fake-host:8001
+      ATTENDANCE_TRITON_YOLO_MODEL_NAME: yolov12
+      ATTENDANCE_TRITON_YOLO_INPUT_NAME: INPUT__0
+      ATTENDANCE_TRITON_YOLO_OUTPUT_NAME: OUTPUT__0
+      ATTENDANCE_TRITON_LVFACE_MODEL_NAME: lvface
+      ATTENDANCE_TRITON_LVFACE_INPUT_NAME: INPUT__0
+      ATTENDANCE_TRITON_LVFACE_LIVENESS_OUTPUT_NAME: LIVENESS__0
+      ATTENDANCE_TRITON_LVFACE_EMBEDDING_OUTPUT_NAME: EMBEDDING__1
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run Alembic migrations
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Run pytest smoke suite
+        run: >-
+          pytest -v --tb=short
+          -m "not slow"
+          --cov=backend/app
+          --cov-report=xml
+          --cov-report=term
+          --cov-fail-under=70
+          --ignore=backend/app/worker/triton_client.py
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml

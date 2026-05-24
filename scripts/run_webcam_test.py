@@ -42,39 +42,34 @@ def _send_frame(
     course_id: str,
     interval_seconds: int,
 ) -> None:
-    """Encode and upload one frame using multipart form data."""
-    ok, encoded = cv2.imencode(".jpg", frame)
-    if not ok:
-        print("[warn] failed to encode frame to JPEG; skipping this interval")
+    """Send one frame as raw uint8 tensor bytes via multipart form data."""
+    if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype.name != "uint8":
+        print(f"[warn] unexpected frame shape/dtype {frame.shape}/{frame.dtype}; skipping")
         return
 
-    jpeg_bytes = encoded.tobytes()
-
+    raw_bytes = frame.tobytes()
     frame_height, frame_width = frame.shape[:2]
+
     form_data = {
         "frame_id": f"webcam-{int(time.time())}",
         "width": str(frame_width),
         "height": str(frame_height),
         "channels": "3",
         "dtype": "uint8",
-        "normalize": "false",
+        "normalize": "true",
         "request_id": request_id,
         "camera_id": camera_id,
         "confidence_threshold": "0.25",
         "liveness_threshold": "0.5",
         "include_embeddings": "false",
         "priority": "false",
-        # Keep a visible dummy metadata marker for local debugging.
-        "course_label": course_id,
     }
 
-    # Backend currently expects a UUID for course_id. When the provided value is not
-    # a UUID, we keep it as metadata only via course_label instead of sending invalid input.
     if _is_uuid(course_id):
         form_data["course_id"] = course_id
 
     files = {
-        "frame_file": ("webcam_frame.jpg", jpeg_bytes, "image/jpeg"),
+        "frame_file": ("webcam_frame.bin", raw_bytes, "application/octet-stream"),
     }
 
     try:

@@ -105,7 +105,7 @@ def _set_auth_cookies(
     cookie_base_kwargs: dict[str, int | str | bool] = {
         "httponly": True,
         "secure": True,
-        "samesite": "lax",
+        "samesite": "strict",
     }
 
     if settings.cookie_domain is not None:
@@ -345,7 +345,11 @@ async def issue_websocket_ticket(current_user: CurrentUser) -> WebSocketTicketRe
     summary="Logout User",
     description="Revoke active tokens and clear authentication cookies.",
 )
-async def logout(request: Request, response: Response) -> LogoutResponse:
+async def logout(
+    request: Request,
+    response: Response,
+    _current_user: CurrentUser,
+) -> LogoutResponse:
     """Best-effort token revocation followed by deterministic cookie invalidation."""
     settings = get_security_settings()
 

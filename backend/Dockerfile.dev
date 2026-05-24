@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml /app/
+COPY backend /app/backend
+# alembic.ini lives inside backend/ and is included in the backend copy above.
+# A symlink makes it visible at /app/alembic.ini as well if needed.
+RUN ln -sf /app/backend/alembic.ini /app/alembic.ini || true
+RUN pip install --no-cache-dir -e ".[dev]"
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app/backend
+WORKDIR /app/backend
+EXPOSE 8000

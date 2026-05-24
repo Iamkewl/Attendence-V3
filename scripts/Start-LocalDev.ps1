@@ -116,7 +116,7 @@ Assert-CommandExists -Name 'python'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = (Resolve-Path -Path (Join-Path -Path $scriptRoot -ChildPath '..')).Path
 $backendDir = (Resolve-Path -Path (Join-Path -Path $projectRoot -ChildPath 'backend')).Path
-$composeFile = Join-Path -Path $projectRoot -ChildPath 'docker-compose.yml'
+$composeFile = Join-Path -Path $projectRoot -ChildPath 'docker-compose.dev.yml'
 
 if (-not (Test-Path -Path $composeFile -PathType Leaf)) {
     throw "Compose file not found at: $composeFile"
@@ -127,14 +127,14 @@ if (-not (Test-Path -Path (Join-Path -Path $backendDir -ChildPath 'alembic.ini')
 }
 
 if ($UseExistingEnvironment) {
-    Set-DefaultEnvVar -Name 'ATTENDANCE_DATABASE_URL' -Value 'postgresql+asyncpg://attendance:attendance@localhost:5432/attendance'
+    Set-DefaultEnvVar -Name 'ATTENDANCE_DATABASE_URL' -Value 'postgresql+asyncpg://attendance:attendance@localhost:15432/attendance'
     Set-DefaultEnvVar -Name 'ATTENDANCE_REDIS_URL' -Value 'redis://localhost:6379/0'
-    Set-DefaultEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me'
+    Set-DefaultEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me-min-32-chars-needed'
     Set-DefaultEnvVar -Name 'ATTENDANCE_ALLOWED_ORIGINS' -Value 'http://localhost:5173,http://localhost:3000,http://localhost:8000'
 } else {
-    Set-ProcessEnvVar -Name 'ATTENDANCE_DATABASE_URL' -Value 'postgresql+asyncpg://attendance:attendance@localhost:5432/attendance'
+    Set-ProcessEnvVar -Name 'ATTENDANCE_DATABASE_URL' -Value 'postgresql+asyncpg://attendance:attendance@localhost:15432/attendance'
     Set-ProcessEnvVar -Name 'ATTENDANCE_REDIS_URL' -Value 'redis://localhost:6379/0'
-    Set-ProcessEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me'
+    Set-ProcessEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me-min-32-chars-needed'
     Set-ProcessEnvVar -Name 'ATTENDANCE_ALLOWED_ORIGINS' -Value 'http://localhost:5173,http://localhost:3000,http://localhost:8000'
 }
 

@@ -1,14 +1,59 @@
-# Python cache and build artifacts
-__pycache__/
-*.py[cod]
-*.egg-info/
+# Local dev artifacts
+.tmp/
+.legacy-rescue/
 
-# Local environments
-.venv/
+# Environment files (never commit credentials)
 .env
-.env.*
+.env.local
+.env.*.local
+backend/.env
+frontend/.env.local
 
-# Generated graph cache artifacts
-graphify-out/cache/
-backend/graphify-out/cache/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.code-workspace
+
+# Agent / Claude Code personal state — not part of the shareable build
+.agents/
+.claude/
+agent-control/
+
+# Obsidian vault metadata (in case it appears anywhere)
+.obsidian/
+
+# ML model artifacts — too large for git; deployed via setup_models.py + scp/rsync
+*.onnx
+*.pt
+*.pth
+*.engine
+*.plan
+infra/models/
+
+# Internal review snapshots — not part of the build
+REVIEW-*.md
+
+# Celery beat runtime state (re-created on each run)
+celerybeat-schedule*
+
+# graphify-mcp generated graph analysis (regenerable)
+graphify-out/
 

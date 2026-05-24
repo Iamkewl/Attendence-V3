@@ -11,7 +11,7 @@ from functools import lru_cache
 from typing import Literal
 from uuid import UUID
 
-from jose import JWTError, jwt
+import jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redis.asyncio import Redis, from_url
@@ -22,8 +22,22 @@ from app.domain.models import UserRole
 TokenType = Literal["access", "refresh"]
 _TOKEN_BLOCKLIST_KEY_PREFIX = "auth:blocklist"
 _PASSWORD_CONTEXT = CryptContext(schemes=["argon2"], deprecated="auto")
+_ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset(
+    {"HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+)
 _redis_client: Redis[str] | None = None
-_redis_lock = asyncio.Lock()
+_redis_lock: asyncio.Lock | None = None
+
+
+def _get_redis_lock() -> asyncio.Lock:
+    global _redis_lock
+    if _redis_lock is None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        _redis_lock = asyncio.Lock()
+    return _redis_lock
 
 
 class SecurityError(Exception):
@@ -103,15 +117,26 @@ def _read_positive_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def _read_jwt_algorithm() -> str:
+    """Read and validate the configured JWT signing algorithm against the allowlist."""
+    algorithm = os.getenv("ATTENDANCE_JWT_ALGORITHM", "HS256").strip()
+    if algorithm not in _ALLOWED_JWT_ALGORITHMS:
+        allowed = ", ".join(sorted(_ALLOWED_JWT_ALGORITHMS))
+        raise RuntimeError(
+            f"Environment variable ATTENDANCE_JWT_ALGORITHM must be one of: {allowed}."
+        )
+    return algorithm
+
+
 @lru_cache(maxsize=1)
 def get_security_settings() -> SecuritySettings:
     """Return cached security settings with production-safe defaults."""
     cookie_domain = os.getenv("ATTENDANCE_COOKIE_DOMAIN")
     return SecuritySettings(
         jwt_secret_key=_read_required_env("ATTENDANCE_JWT_SECRET"),
-        jwt_algorithm=os.getenv("ATTENDANCE_JWT_ALGORITHM", "HS256"),
-        jwt_issuer=os.getenv("ATTENDANCE_JWT_ISSUER", "attendance-v2-backend"),
-        jwt_audience=os.getenv("ATTENDANCE_JWT_AUDIENCE", "attendance-v2-client"),
+        jwt_algorithm=_read_jwt_algorithm(),
+        jwt_issuer=os.getenv("ATTENDANCE_JWT_ISSUER", "attendance-v3-backend"),
+        jwt_audience=os.getenv("ATTENDANCE_JWT_AUDIENCE", "attendance-v3-client"),
         access_token_ttl_minutes=_read_positive_int_env("ATTENDANCE_ACCESS_TOKEN_TTL_MINUTES", 15),
         refresh_token_ttl_days=_read_positive_int_env("ATTENDANCE_REFRESH_TOKEN_TTL_DAYS", 7),
         redis_url=_read_required_env("ATTENDANCE_REDIS_URL"),
@@ -201,9 +226,9 @@ def decode_token(token: str) -> TokenClaims:
             algorithms=[settings.jwt_algorithm],
             audience=settings.jwt_audience,
             issuer=settings.jwt_issuer,
-            options={"require_sub": True, "require_exp": True, "require_iat": True},
+            options={"require": ["sub", "exp", "iat", "jti", "type", "iss", "aud", "role"]},
         )
-    except JWTError as exc:
+    except jwt.PyJWTError as exc:
         raise InvalidTokenError("Invalid or expired token.") from exc
 
     try:
@@ -232,7 +257,7 @@ async def initialize_redis() -> Redis[str]:
     if _redis_client is not None:
         return _redis_client
 
-    async with _redis_lock:
+    async with _get_redis_lock():
         if _redis_client is None:
             settings = get_security_settings()
             client = from_url(
@@ -263,7 +288,7 @@ async def close_redis() -> None:
     """Close the shared Redis connection during application shutdown."""
     global _redis_client
 
-    async with _redis_lock:
+    async with _get_redis_lock():
         if _redis_client is not None:
             await _redis_client.aclose()
             _redis_client = None

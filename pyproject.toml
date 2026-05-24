@@ -20,11 +20,10 @@ dependencies = [
     "passlib[argon2]>=1.7.4,<2.0.0",
     "pgvector>=0.3.5,<1.0.0",
     "pillow>=10.4.0,<12.0.0",
-    "python-jose[cryptography]>=3.3.0,<4.0.0",
+    "pyjwt[crypto]>=2.9.0,<3.0.0",
     "redis>=5.0.4,<6.0.0",
     "tritonclient[grpc]>=2.56.0,<3.0.0",
     "asyncpg>=0.30.0,<1.0.0",
-    "psycopg2-binary>=2.9.9,<3.0.0",
     "uvicorn[standard]>=0.30.1,<1.0.0",
 ]
 
@@ -35,6 +34,7 @@ dev = [
     "pytest-cov>=6.1.1,<7.0.0",
     "ruff>=0.11.10,<1.0.0",
     "mypy>=1.15.0,<2.0.0",
+    "psycopg2-binary>=2.9.9,<3.0.0",
 ]
 
 [tool.setuptools]
@@ -50,6 +50,16 @@ addopts = "-ra --strict-config --strict-markers"
 testpaths = ["backend/tests"]
 pythonpath = ["backend"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 filterwarnings = [
     "error",
+    "ignore::DeprecationWarning:argon2",
+    "ignore::DeprecationWarning:alembic",
+    "ignore::DeprecationWarning:passlib",
+    "ignore::ResourceWarning",
+    "ignore:Exception ignored in:pytest.PytestUnraisableExceptionWarning",
+    "ignore:coroutine .* was never awaited:RuntimeWarning",
+    "ignore::jwt.warnings.InsecureKeyLengthWarning",
+    "ignore:Setting per-request cookies:DeprecationWarning:httpx",
 ]

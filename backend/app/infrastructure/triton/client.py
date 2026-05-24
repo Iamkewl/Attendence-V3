@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
+import asyncio
 import time
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Sequence
 
@@ -12,6 +11,8 @@ import grpc
 import numpy as np
 import tritonclient.grpc as grpcclient
 from tritonclient.utils import InferenceServerException
+
+from .settings import TritonClientSettings, get_triton_client_settings
 
 
 class TritonClientError(RuntimeError):
@@ -34,103 +35,13 @@ class TritonInferenceError(TritonClientError):
     """Raised when inference execution fails and cannot be retried."""
 
 
-@dataclass(frozen=True, slots=True)
-class TritonClientSettings:
-    """Runtime settings controlling Triton connectivity and retry behavior."""
-
-    url: str
-    request_timeout_seconds: float
-    max_retries: int
-    retry_backoff_seconds: float
-    ssl_enabled: bool
-
-
-def _read_required_env(name: str) -> str:
-    """Read a required environment variable and fail fast when not configured."""
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        raise RuntimeError(f"Environment variable {name} must be set.")
-    return value.strip()
-
-
-def _read_float_env(name: str, default: float, *, min_value: float) -> float:
-    """Read a floating-point environment variable with lower-bound validation."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Environment variable {name} must be a floating-point number.") from exc
-
-    if value < min_value:
-        raise RuntimeError(
-            f"Environment variable {name} must be greater than or equal to {min_value}."
-        )
-
-    return value
-
-
-def _read_int_env(name: str, default: int, *, min_value: int) -> int:
-    """Read an integer environment variable with explicit lower-bound validation."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Environment variable {name} must be an integer.") from exc
-
-    if value < min_value:
-        raise RuntimeError(
-            f"Environment variable {name} must be greater than or equal to {min_value}."
-        )
-
-    return value
-
-
-def _read_bool_env(name: str, default: bool) -> bool:
-    """Read a boolean environment variable using common truthy and falsy values."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-
-    raise RuntimeError(f"Environment variable {name} must be a boolean value.")
-
-
-@lru_cache(maxsize=1)
-def get_triton_client_settings() -> TritonClientSettings:
-    """Return cached Triton client settings sourced from environment variables."""
-    return TritonClientSettings(
-        url=_read_required_env("ATTENDANCE_TRITON_URL"),
-        request_timeout_seconds=_read_float_env(
-            "ATTENDANCE_TRITON_REQUEST_TIMEOUT_SECONDS",
-            10.0,
-            min_value=0.1,
-        ),
-        max_retries=_read_int_env("ATTENDANCE_TRITON_MAX_RETRIES", 3, min_value=0),
-        retry_backoff_seconds=_read_float_env(
-            "ATTENDANCE_TRITON_RETRY_BACKOFF_SECONDS",
-            0.35,
-            min_value=0.05,
-        ),
-        ssl_enabled=_read_bool_env("ATTENDANCE_TRITON_SSL_ENABLED", False),
-    )
-
-
 class TritonGrpcClient:
     """High-level Triton gRPC helper that enforces readiness checks and retry policy."""
 
     def __init__(self, settings: TritonClientSettings | None = None) -> None:
         self._settings = settings or get_triton_client_settings()
+        self._server_ready: bool = False
+        self._ready_models: set[tuple[str, str]] = set()
         try:
             self._client = grpcclient.InferenceServerClient(
                 url=self._settings.url,
@@ -150,6 +61,8 @@ class TritonGrpcClient:
 
     def assert_server_ready(self) -> None:
         """Ensure Triton server is live and ready before submitting inference requests."""
+        if self._server_ready:
+            return
 
         def check_live() -> bool:
             return bool(self._client.is_server_live())
@@ -166,8 +79,14 @@ class TritonGrpcClient:
         if not is_ready:
             raise TritonServerUnavailableError("Triton server is live but not ready.")
 
+        self._server_ready = True
+
     def assert_model_ready(self, model_name: str, model_version: str = "") -> None:
         """Ensure the specified model is available and ready for inference."""
+        cache_key = (model_name, model_version)
+        if cache_key in self._ready_models:
+            return
+
         self.assert_server_ready()
 
         def check_model_ready() -> bool:
@@ -189,6 +108,19 @@ class TritonGrpcClient:
                     f"Model {model_name} version {model_version} is not ready."
                 )
             raise TritonModelUnavailableError(f"Model {model_name} is not ready.")
+
+        self._ready_models.add(cache_key)
+
+    def invalidate_readiness_cache(self) -> None:
+        """Clear cached readiness state so subsequent calls re-verify against the server."""
+        self._server_ready = False
+        self._ready_models.clear()
+
+    def prime_readiness(self, model_names: Sequence[str]) -> None:
+        """Pre-verify server and named models once so inference paths skip readiness pings."""
+        self.assert_server_ready()
+        for model_name in model_names:
+            self.assert_model_ready(model_name=model_name)
 
     def infer_fp32(
         self,
@@ -244,6 +176,40 @@ class TritonGrpcClient:
         result = self._run_with_retries(perform_inference, f"inference call to model {model_name}")
         return self._parse_infer_outputs(result=result)
 
+    async def assert_server_ready_async(self) -> None:
+        """Async wrapper for assert_server_ready; safe to call from the FastAPI event loop."""
+        await asyncio.to_thread(self.assert_server_ready)
+
+    async def assert_model_ready_async(self, model_name: str, model_version: str = "") -> None:
+        """Async wrapper for assert_model_ready; safe to call from the FastAPI event loop."""
+        await asyncio.to_thread(self.assert_model_ready, model_name, model_version)
+
+    async def prime_readiness_async(self, model_names: Sequence[str]) -> None:
+        """Async wrapper for prime_readiness; safe to call from the FastAPI event loop."""
+        await asyncio.to_thread(self.prime_readiness, model_names)
+
+    async def infer_fp32_async(
+        self,
+        *,
+        model_name: str,
+        tensors: dict[str, np.ndarray],
+        output_names: Sequence[str] | None = None,
+        model_version: str = "",
+        request_id: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Async wrapper for infer_fp32; safe to call from the FastAPI event loop."""
+        return await asyncio.to_thread(
+            lambda: self.infer_fp32(
+                model_name=model_name,
+                tensors=tensors,
+                output_names=output_names,
+                model_version=model_version,
+                request_id=request_id,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+
     def _numpy_to_infer_input(self, *, name: str, tensor: np.ndarray) -> grpcclient.InferInput:
         """Convert a NumPy tensor to Triton's FP32 InferInput payload."""
         contiguous_tensor = np.ascontiguousarray(tensor, dtype=np.float32)
@@ -275,6 +241,7 @@ class TritonGrpcClient:
     def _run_with_retries(self, operation: Callable[[], object], operation_name: str) -> object:
         """Execute an operation with exponential backoff for retryable failures."""
         max_attempts = self._settings.max_retries + 1
+        deadline = time.monotonic() + self._settings.total_retry_budget_seconds
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -282,13 +249,24 @@ class TritonGrpcClient:
             except TritonTimeoutError:
                 if attempt >= max_attempts:
                     raise
-                time.sleep(self._settings.retry_backoff_seconds * (2 ** (attempt - 1)))
+                self.invalidate_readiness_cache()
+                sleep_duration = self._settings.retry_backoff_seconds * (2 ** (attempt - 1))
+                if time.monotonic() + sleep_duration >= deadline:
+                    raise
+                time.sleep(sleep_duration)
             except (InferenceServerException, grpc.RpcError, OSError) as exc:
                 if not self._is_retryable_exception(exc) or attempt >= max_attempts:
                     raise TritonInferenceError(
                         f"{operation_name} failed after {attempt} attempt(s): {exc}"
                     ) from exc
-                time.sleep(self._settings.retry_backoff_seconds * (2 ** (attempt - 1)))
+                self.invalidate_readiness_cache()
+                sleep_duration = self._settings.retry_backoff_seconds * (2 ** (attempt - 1))
+                if time.monotonic() + sleep_duration >= deadline:
+                    raise TritonInferenceError(
+                        f"{operation_name} exceeded retry budget of"
+                        f" {self._settings.total_retry_budget_seconds}s after {attempt} attempt(s): {exc}"
+                    ) from exc
+                time.sleep(sleep_duration)
             except Exception as exc:
                 raise TritonInferenceError(f"{operation_name} failed: {exc}") from exc
 
@@ -329,18 +307,39 @@ class TritonGrpcClient:
 
 
 @lru_cache(maxsize=1)
-def get_triton_client() -> TritonGrpcClient:
-    """Create and cache a singleton Triton gRPC wrapper instance."""
+def _build_triton_client() -> TritonGrpcClient:
     return TritonGrpcClient()
 
 
+# Explicit test seam — only ever set by test fixtures, never in production code.
+_test_client_override: TritonGrpcClient | None = None
+
+
+def set_triton_client_override(client: TritonGrpcClient | None) -> None:
+    """Replace the module-level singleton for test isolation.
+
+    Call with a fake client before each test, restore with None after yield.
+    Works for both FastAPI-path tests and Celery eager-mode tests since it
+    bypasses the lru_cache without monkeypatching.
+    """
+    global _test_client_override
+    _test_client_override = client
+
+
+def get_triton_client() -> TritonGrpcClient:
+    """Return the active Triton client — the test override if set, the singleton otherwise."""
+    if _test_client_override is not None:
+        return _test_client_override
+    return _build_triton_client()
+
+
 def clear_triton_client_cache() -> None:
-    """Clear cached Triton wrapper and settings to support dynamic test/runtime reconfiguration."""
-    cached_client = get_triton_client.cache_info().currsize
+    """Clear cached Triton wrapper and settings to support dynamic runtime reconfiguration."""
+    cached_client = _build_triton_client.cache_info().currsize
     if cached_client:
-        client = get_triton_client()
+        client = _build_triton_client()
         client.close()
-    get_triton_client.cache_clear()
+    _build_triton_client.cache_clear()
     get_triton_client_settings.cache_clear()
 
 
@@ -354,4 +353,5 @@ __all__ = [
     "clear_triton_client_cache",
     "get_triton_client",
     "get_triton_client_settings",
+    "set_triton_client_override",
 ]

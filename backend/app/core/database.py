@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncGenerator
 from functools import lru_cache
 
+
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _read_int_env(name: str, default: int) -> int:
@@ -87,7 +92,10 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
         try:
             yield session
         except Exception:
-            await session.rollback()
+            try:
+                await session.rollback()
+            except Exception:
+                LOGGER.exception("Session rollback failed while handling outer exception.")
             raise
 
 

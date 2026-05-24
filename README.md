@@ -11,17 +11,44 @@ It is intentionally separated from the agent control plane.
 - Frontend: React + Vite single-page app.
 - Inference tooling: model setup and remote Triton deployment/tunnel scripts.
 
+## Further Documentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — system design, request flow, key abstractions, and the test-seam pattern for Triton.
+- [RUNBOOK.md](./RUNBOOK.md) — operational procedures: starting/stopping services, common troubleshooting, demo mode.
+
 ## Repository Layout
 
 ```text
-project/
-|- backend/                # FastAPI app, Alembic migrations, Celery worker code
-|- frontend/               # React + Vite frontend
-|- scripts/                # Local dev, model setup, tunnel, and deploy scripts
-|- infra/                  # Triton GPU compose stack and model repository
-|- docker-compose.yml      # Local postgres + redis services
-|- pyproject.toml          # Python package metadata and test/dev configuration
+Attendence-v3/                        # repo root (no project/ prefix)
+|- backend/                           # FastAPI app, Alembic migrations, Celery worker
+|   └── app/
+|       |- api/v1/                    # route handlers and shared deps
+|       |- domain/
+|       |   |- models/                # SQLAlchemy ORM models (one file per entity)
+|       |   └── schemas/              # Pydantic schemas (one file per domain area)
+|       |- infrastructure/
+|       |   └── triton/               # Triton Inference Server HTTP/gRPC client
+|       |- services/
+|       |   |- pipeline/              # 8-module inference pipeline subpackage
+|       |   └── pipeline_service.py   # thin facade re-exporting pipeline public API
+|       └── worker/                   # Celery app, tasks, demo emitter
+|- frontend/                          # React + Vite single-page app
+|- scripts/                           # Local dev, model setup, tunnel, and deploy scripts
+|- infra/                             # Triton GPU compose stack and model repository
+|- docker-compose.dev.yml             # Local postgres + redis services
+└── pyproject.toml                    # Python package metadata and test/dev configuration
 ```
+
+## Code Architecture
+
+Four subpackages were introduced in the Phase A refactor:
+
+- `app.services.pipeline` — the inference pipeline broken into focused modules: `settings`, `frame`, `detection`, `tracking`, `liveness`, `embedding`, `matching`, and `orchestrator`. The entry point for callers is the facade below.
+- `app.domain.models` — SQLAlchemy ORM model classes split into one file per entity (user, student, course, room, session, sighting, governance); `__init__.py` re-exports all public symbols so existing `from app.domain.models import X` imports continue to work.
+- `app.domain.schemas` — Pydantic request/response schemas split by domain area (user, student, course, attendance, inference, common); `__init__.py` re-exports all public symbols for backward compatibility.
+- `app.infrastructure.triton` — Triton HTTP/gRPC client and its settings model, extracted from the worker layer. Import from here, not from `app.worker.triton_client`.
+
+Facade pattern: `app.services.pipeline_service` is a thin import-forwarding module. It does not contain logic; it re-exports the public surface of `app.services.pipeline` so call sites outside the subpackage use a stable single import path.
 
 ## Prerequisites
 
@@ -71,16 +98,18 @@ Default local URLs:
 From the project root:
 
 ```powershell
-docker compose -f .\docker-compose.yml up -d postgres redis
+docker compose -f .\docker-compose.dev.yml up -d postgres redis
 python -m pip install -e .
 ```
 
-Set required backend environment variables in your shell:
+Set required backend environment variables in your shell. Note Postgres is
+exposed on host port **15432** (not 5432) to avoid conflicts with any local
+Postgres install:
 
 ```powershell
-$env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:5432/attendance"
+$env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
 $env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
-$env:ATTENDANCE_JWT_SECRET = "dev-only-change-me"
+$env:ATTENDANCE_JWT_SECRET = "dev-only-change-me-min-32-chars-needed"
 $env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:3000,http://localhost:8000"
 ```
 
@@ -167,10 +196,10 @@ npm run preview
 
 ```powershell
 # Stop local infra containers
-docker compose -f .\docker-compose.yml down
+docker compose -f .\docker-compose.dev.yml down
 
 # Stop and remove local volumes (useful when resetting local DB state)
-docker compose -f .\docker-compose.yml down -v
+docker compose -f .\docker-compose.dev.yml down -v
 ```
 
 ## Environment Variables
@@ -247,13 +276,25 @@ npm run build
 
 ### 3) Python/Backend Test Runner
 
-Pytest is configured in `pyproject.toml` to use `backend/tests`.
+Pytest is configured in `pyproject.toml` to use `backend/tests`. The smoke
+suite covers seven flows: auth cookie issuance, inference stream dispatch,
+eager pipeline sighting persistence, task-status embedding strip, daily
+aggregation, WebSocket ticket gate, and an SSE format regression.
+
+The suite needs Postgres + Redis running (`docker compose -f .\docker-compose.dev.yml up -d postgres redis`) and these env vars in the shell:
 
 ```powershell
+$env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
+$env:ATTENDANCE_DATABASE_URL_TEST = $env:ATTENDANCE_DATABASE_URL
+$env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
+$env:ATTENDANCE_JWT_SECRET = "test-secret-32chars-minimum-needed"
+$env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:3000"
+$env:ATTENDANCE_TRITON_URL = "fake-host:8001"   # Triton is faked in tests
 python -m pytest
 ```
 
-If no tests exist yet in `backend/tests`, pytest may report no tests collected.
+Expected: `7 passed`. Triton is replaced by `FakeTritonGrpcClient` via the
+`set_triton_client_override()` test seam — no real GPU is required.
 
 ### 4) Inference Pipeline Local Validation (Optional)
 

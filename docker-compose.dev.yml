@@ -1,0 +1,126 @@
+version: "3.9"
+
+volumes:
+  attendance_pg_data:
+
+x-api-env: &api-env
+  ATTENDANCE_DATABASE_URL: postgresql+asyncpg://attendance:attendance@postgres:5432/attendance
+  ATTENDANCE_REDIS_URL: redis://redis:6379/0
+  ATTENDANCE_JWT_SECRET: demo-jwt-secret-replace-in-prod
+  ATTENDANCE_ALLOWED_ORIGINS: http://localhost:5173,http://localhost:8000
+  ATTENDANCE_TRITON_URL: 10.1.46.86:8001
+  ATTENDANCE_TRITON_DEMO_MODE: "false"
+  ATTENDANCE_TRITON_YOLO_MODEL_NAME: yolov12
+  ATTENDANCE_TRITON_YOLO_INPUT_NAME: INPUT__0
+  ATTENDANCE_TRITON_YOLO_OUTPUT_NAME: OUTPUT__0
+  ATTENDANCE_TRITON_LVFACE_MODEL_NAME: lvface
+  ATTENDANCE_TRITON_LVFACE_INPUT_NAME: INPUT__0
+  ATTENDANCE_TRITON_LVFACE_LIVENESS_OUTPUT_NAME: LIVENESS__0
+  ATTENDANCE_TRITON_LVFACE_EMBEDDING_OUTPUT_NAME: EMBEDDING__1
+  ATTENDANCE_DEMO_MODE: "false"
+  ATTENDANCE_DEMO_COURSE_ID: "00000000-0000-4000-a000-000000000001"
+  ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS: "5"
+  ATTENDANCE_COOKIE_DOMAIN: ""
+  PYTHONUNBUFFERED: "1"
+
+x-api-build: &api-build
+  build:
+    context: .
+    dockerfile: backend/Dockerfile.dev
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: attendance
+      POSTGRES_USER: attendance
+      POSTGRES_PASSWORD: attendance
+    volumes:
+      - attendance_pg_data:/var/lib/postgresql/data
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U attendance -d attendance"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    <<: *api-build
+    environment:
+      <<: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+    command: >
+      uvicorn app.main:create_app --factory
+      --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *api-build
+    environment:
+      <<: *api-env
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+    command: >
+      celery -A app.worker.celery_app:celery_app worker
+      --loglevel=info
+      --queues=inference,inference_priority,attendance_aggregation
+      --concurrency=2
+
+  beat:
+    <<: *api-build
+    environment:
+      <<: *api-env
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+    command: >
+      celery -A app.worker.celery_app:celery_app beat
+      --loglevel=info
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_DEMO_COURSE_ID: "00000000-0000-4000-a000-000000000001"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - api

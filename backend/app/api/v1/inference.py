@@ -3,24 +3,37 @@
 from __future__ import annotations
 
 import base64
+import io
 import logging
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
+import numpy as np
 from celery import states
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from PIL import Image
 from pydantic import ValidationError
+from sqlalchemy import select
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentInstructorUser, CurrentUser
+from app.core.database import get_session_factory
+from app.domain.models import Student, User
 from app.domain.schemas import (
     ImageTensorPayload,
     InferenceBatchRequest,
     InferenceTaskAccepted,
     InferenceTaskStatus,
+    RecognitionDetection,
+    RecognitionMatch,
+    RecognitionPhotoResponse,
 )
+from app.services.pipeline_service import process_inference_batch
 from app.worker.celery_app import celery_app
 from app.worker.tasks import run_inference_pipeline
+from app.infrastructure.triton import (
+    TritonClientError,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -163,7 +176,8 @@ async def get_inference_task_status(_: CurrentUser, task_id: str) -> InferenceTa
 
     if state == states.SUCCESS:
         if isinstance(task_result.result, dict):
-            return InferenceTaskStatus(task_id=task_id, state=state, result=task_result.result)
+            sanitized = _strip_embeddings_from_task_result(task_result.result)
+            return InferenceTaskStatus(task_id=task_id, state=state, result=sanitized)
         return InferenceTaskStatus(
             task_id=task_id,
             state=state,
@@ -174,6 +188,173 @@ async def get_inference_task_status(_: CurrentUser, task_id: str) -> InferenceTa
         return InferenceTaskStatus(task_id=task_id, state=state, error=str(task_result.result))
 
     return InferenceTaskStatus(task_id=task_id, state=state)
+
+
+def _strip_embeddings_from_task_result(result: dict[str, object]) -> dict[str, object]:
+    """Defense-in-depth: scrub face embeddings before returning task results without ownership checks."""
+    sanitized: dict[str, object] = dict(result)
+    items = sanitized.get("results")
+    if isinstance(items, list):
+        sanitized["results"] = [
+            {**item, "embedding": None} if isinstance(item, dict) and "embedding" in item else item
+            for item in items
+        ]
+    return sanitized
+
+
+_MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+@router.post(
+    "/photo",
+    response_model=RecognitionPhotoResponse,
+    summary="Synchronous Recognition Test",
+    description=(
+        "Decode an image, run full detection + recognition pipeline in-process, "
+        "return matched faces. Does not persist sighting rows."
+    ),
+)
+async def recognize_photo(
+    _: CurrentInstructorUser,
+    file: Annotated[UploadFile, File(description="JPEG or PNG image.")],
+    course_id: Annotated[UUID | None, Form()] = None,
+    confidence_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.25,
+    liveness_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.5,
+) -> RecognitionPhotoResponse:
+    """Run synchronous detection and recognition on a single uploaded photo."""
+    raw_bytes = await file.read()
+
+    if len(raw_bytes) > _MAX_PHOTO_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Image file exceeds maximum allowed size of 10 MB.",
+        )
+
+    if not raw_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty.",
+        )
+
+    try:
+        pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Image decode failed: file is not a valid JPEG or PNG.",
+        ) from exc
+
+    width, height = pil_image.size
+    frame_array = np.asarray(pil_image, dtype=np.uint8)
+    frame_bytes = frame_array.tobytes()
+
+    now = datetime.now(tz=UTC)
+    frame_payload = ImageTensorPayload(
+        frame_id="photo_test",
+        data_base64=base64.b64encode(frame_bytes).decode("ascii"),
+        width=width,
+        height=height,
+        channels=3,
+        dtype="uint8",
+        normalize=True,
+        captured_at=now,
+    )
+    batch_request = InferenceBatchRequest(
+        course_id=course_id,
+        frames=[frame_payload],
+        confidence_threshold=confidence_threshold,
+        liveness_threshold=liveness_threshold,
+        include_embeddings=False,
+    )
+
+    try:
+        pipeline_result = await process_inference_batch(batch_request)
+    except TritonClientError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Triton unavailable: {exc}",
+        ) from exc
+    except Exception as exc:
+        LOGGER.exception("Unexpected error in synchronous inference pipeline.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal pipeline error.",
+        ) from exc
+
+    raw_results: list[dict] = pipeline_result.get("results", [])
+
+    # Batch-resolve student names and numbers for all matched student IDs.
+    matched_student_ids = [
+        UUID(item["student_id"])
+        for item in raw_results
+        if item.get("student_id") is not None
+    ]
+
+    student_info: dict[UUID, tuple[str, str]] = {}
+    if matched_student_ids:
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        Student.id,
+                        Student.student_number,
+                        Student.user_id,
+                    ).where(Student.id.in_(matched_student_ids))
+                )
+            ).all()
+
+            user_ids = [row.user_id for row in rows]
+            user_rows = (
+                await session.execute(
+                    select(User.id, User.full_name).where(
+                        User.id.in_(user_ids)
+                    )
+                )
+            ).all()
+
+            user_name_map: dict[UUID, str] = {row.id: row.full_name for row in user_rows}
+            for row in rows:
+                student_info[row.id] = (
+                    user_name_map.get(row.user_id, ""),
+                    row.student_number,
+                )
+
+    detections: list[RecognitionDetection] = []
+    for item in raw_results:
+        raw_student_id = item.get("student_id")
+        match: RecognitionMatch | None = None
+        if raw_student_id is not None:
+            sid = UUID(raw_student_id)
+            full_name, student_number = student_info.get(sid, ("", ""))
+            match = RecognitionMatch(
+                student_id=sid,
+                student_full_name=full_name,
+                student_number=student_number,
+                cosine_similarity=float(item.get("cosine_similarity") or 0.0),
+            )
+
+        detections.append(
+            RecognitionDetection(
+                track_id=int(item["track_id"]),
+                bbox=[float(v) for v in item["bbox"]],
+                confidence=float(item["detection_score"]),
+                liveness_score=float(item["liveness_score"]),
+                is_live=bool(item["is_live"]),
+                match=match,
+            )
+        )
+
+    match_count = sum(1 for d in detections if d.match is not None)
+
+    return RecognitionPhotoResponse(
+        image_width=width,
+        image_height=height,
+        detection_count=len(detections),
+        match_count=match_count,
+        processed_at=now,
+        detections=detections,
+    )
 
 
 __all__ = ["router"]

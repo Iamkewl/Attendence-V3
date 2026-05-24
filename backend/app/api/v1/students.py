@@ -20,7 +20,7 @@ from app.domain.models import Student, StudentEmbedding, TemplateAuditLog
 from app.domain.schemas import StudentCreate, StudentEnrollmentRead, StudentRead, StudentUpdate
 from app.services.pipeline_service import extract_enrollment_embedding
 from app.services.student_service import StudentLinkValidationError, StudentService
-from app.worker.triton_client import (
+from app.infrastructure.triton import (
     TritonInferenceError,
     TritonModelUnavailableError,
     TritonServerUnavailableError,
@@ -183,7 +183,7 @@ async def enroll_student_template(
     image_tensor = await _decode_enrollment_image(image_file)
 
     try:
-        embedding, quality_score = extract_enrollment_embedding(image_tensor)
+        embedding, quality_score = await extract_enrollment_embedding(image_tensor)
     except (
         TritonTimeoutError,
         TritonServerUnavailableError,

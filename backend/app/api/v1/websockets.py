@@ -144,7 +144,9 @@ async def websocket_live(websocket: WebSocket) -> None:
     await _connection_manager.connect(websocket)
     try:
         while True:
-            await websocket.receive()
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
     except WebSocketDisconnect:
         pass
     finally:
@@ -193,7 +195,7 @@ async def sse_live(
                     separators=(",", ":"),
                     ensure_ascii=True,
                 )
-                yield f"event: {message.channel}\\ndata: {payload}\\n\\n"
+                yield f"event: {message.channel}\ndata: {payload}\n\n"
         finally:
             stop_event.set()
             disconnect_task.cancel()

@@ -56,7 +56,7 @@ def upgrade() -> None:
         existing_type=postgresql.UUID(as_uuid=True),
     )
     op.create_foreign_key(
-        "fk_governance_logs_class_session_record_id_class_session_records",
+        "fk_governance_logs_class_session_record_id",
         "governance_logs",
         "class_session_records",
         ["class_session_record_id"],
@@ -79,10 +79,9 @@ def upgrade() -> None:
         "class_session_records",
         type_="unique",
     )
-    op.drop_constraint(
-        "attendance_session_time_order",
-        "class_session_records",
-        type_="check",
+    op.execute(
+        "ALTER TABLE class_session_records "
+        "DROP CONSTRAINT ck_attendance_records_attendance_session_time_order"
     )
 
     op.add_column(
@@ -291,7 +290,7 @@ def downgrade() -> None:
     )
 
     op.drop_constraint(
-        "fk_governance_logs_class_session_record_id_class_session_records",
+        "fk_governance_logs_class_session_record_id",
         "governance_logs",
         type_="foreignkey",
     )

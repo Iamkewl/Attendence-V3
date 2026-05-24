@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import timedelta
 from functools import lru_cache
 
 from celery import Celery
+from celery.signals import worker_process_init
 from kombu import Queue
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _read_required_env(name: str) -> str:
@@ -35,6 +40,41 @@ def _read_int_env(name: str, default: int, *, min_value: int = 0) -> int:
         )
 
     return value
+
+
+def _build_beat_schedule(
+    *,
+    attendance_eval_interval_seconds: int,
+    attendance_required_sightings_threshold: int,
+    demo_mode_enabled: bool,
+    demo_sighting_interval_seconds: int,
+) -> dict[str, object]:
+    """Construct the beat_schedule dict, adding demo entries only when demo mode is active."""
+    schedule: dict[str, object] = {
+        "attendance-evaluation-hourly": {
+            "task": "app.worker.tasks.task_evaluate_daily_attendance",
+            "schedule": timedelta(seconds=attendance_eval_interval_seconds),
+            "kwargs": {
+                "required_sightings_threshold": attendance_required_sightings_threshold,
+            },
+            "options": {
+                "queue": "attendance_aggregation",
+                "routing_key": "attendance.aggregation",
+            },
+        },
+    }
+
+    if demo_mode_enabled:
+        schedule["demo-synthetic-sighting"] = {
+            "task": "app.worker.tasks.demo_emit_sighting",
+            "schedule": timedelta(seconds=demo_sighting_interval_seconds),
+            "options": {
+                "queue": "attendance_aggregation",
+                "routing_key": "attendance.aggregation",
+            },
+        }
+
+    return schedule
 
 
 @lru_cache(maxsize=1)
@@ -65,6 +105,15 @@ def get_celery_app() -> Celery:
         min_value=1,
     )
 
+    demo_mode_enabled = (
+        os.getenv("ATTENDANCE_DEMO_MODE", "").strip().lower() in {"1", "true", "yes"}
+    )
+    demo_sighting_interval_seconds = _read_int_env(
+        "ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS",
+        5,
+        min_value=1,
+    )
+
     app = Celery(
         "attendance_v2_worker",
         broker=broker_url,
@@ -87,28 +136,17 @@ def get_celery_app() -> Celery:
             Queue("attendance_aggregation", routing_key="attendance.aggregation"),
         ),
         task_routes={
-            "app.worker.tasks.run_inference_pipeline": {
-                "queue": "inference",
-                "routing_key": "inference.default",
-            },
             "app.worker.tasks.task_evaluate_daily_attendance": {
                 "queue": "attendance_aggregation",
                 "routing_key": "attendance.aggregation",
             },
         },
-        beat_schedule={
-            "attendance-evaluation-hourly": {
-                "task": "app.worker.tasks.task_evaluate_daily_attendance",
-                "schedule": timedelta(seconds=attendance_eval_interval_seconds),
-                "kwargs": {
-                    "required_sightings_threshold": attendance_required_sightings_threshold,
-                },
-                "options": {
-                    "queue": "attendance_aggregation",
-                    "routing_key": "attendance.aggregation",
-                },
-            },
-        },
+        beat_schedule=_build_beat_schedule(
+            attendance_eval_interval_seconds=attendance_eval_interval_seconds,
+            attendance_required_sightings_threshold=attendance_required_sightings_threshold,
+            demo_mode_enabled=demo_mode_enabled,
+            demo_sighting_interval_seconds=demo_sighting_interval_seconds,
+        ),
         task_track_started=True,
         task_acks_late=True,
         task_reject_on_worker_lost=True,
@@ -155,6 +193,29 @@ def get_celery_app() -> Celery:
 
 
 celery_app = get_celery_app()
+
+
+@worker_process_init.connect
+def _prime_triton_readiness(**_: object) -> None:
+    """Pre-verify Triton readiness for configured models once per worker process."""
+    yolo_model = os.getenv("ATTENDANCE_TRITON_YOLO_MODEL_NAME", "yolov12").strip() or "yolov12"
+    lvface_model = os.getenv("ATTENDANCE_TRITON_LVFACE_MODEL_NAME", "lvface").strip() or "lvface"
+
+    try:
+        from app.infrastructure.triton import get_triton_client
+
+        get_triton_client().prime_readiness([yolo_model, lvface_model])
+    except Exception:
+        LOGGER.warning(
+            "Failed to prime Triton readiness during worker init; readiness will be verified on the first inference call.",
+            exc_info=True,
+        )
+    else:
+        LOGGER.info(
+            "Primed Triton readiness for models: %s, %s",
+            yolo_model,
+            lvface_model,
+        )
 
 
 __all__ = ["celery_app", "get_celery_app"]
