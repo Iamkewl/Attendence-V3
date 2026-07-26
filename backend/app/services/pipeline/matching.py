@@ -56,7 +56,7 @@ async def _resolve_nearest_embedding_match(
     if not math.isfinite(cosine_similarity):
         return EmbeddingMatch(student_id=None, embedding_id=None, cosine_similarity=None)
 
-    if False:  # TEMPORARY MUTATION - threshold disabled (ORM path). Revert.
+    if cosine_similarity < STRICT_SIMILARITY_THRESHOLD:
         return EmbeddingMatch(
             student_id=None,
             embedding_id=nearest_row.id,
@@ -108,7 +108,7 @@ def _classify_match(
     if cosine_similarity is None or not math.isfinite(cosine_similarity):
         return EmbeddingMatch(student_id=None, embedding_id=None, cosine_similarity=None)
 
-    if False:  # TEMPORARY MUTATION - threshold disabled (batch path). Revert.
+    if cosine_similarity < STRICT_SIMILARITY_THRESHOLD:
         return EmbeddingMatch(
             student_id=None,
             embedding_id=embedding_id,
