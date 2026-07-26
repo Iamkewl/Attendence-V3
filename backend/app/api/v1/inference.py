@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
+import os
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
@@ -18,7 +20,8 @@ from sqlalchemy import select
 
 from app.api.deps import CurrentInstructorUser, CurrentUser
 from app.core.database import get_session_factory
-from app.domain.models import Student, User
+from app.core.security import get_redis_client
+from app.domain.models import Student, User, UserRole
 from app.domain.schemas import (
     ImageTensorPayload,
     InferenceBatchRequest,
@@ -28,17 +31,87 @@ from app.domain.schemas import (
     RecognitionMatch,
     RecognitionPhotoResponse,
 )
-from app.services.pipeline_service import process_inference_batch
-from app.worker.celery_app import celery_app
-from app.worker.tasks import run_inference_pipeline
 from app.infrastructure.triton import (
     TritonClientError,
 )
-
+from app.services.pipeline_service import process_inference_batch
+from app.worker.celery_app import celery_app
+from app.worker.tasks import run_inference_pipeline
 
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/inference", tags=["Inference"])
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    """Read an int env var; reject zero/negative/non-int values (default when unset)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be an integer.") from exc
+    if value < 1:
+        raise RuntimeError(f"Environment variable {name} must be a positive integer.")
+    return value
+
+
+_DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024  # 4 MiB raw tensor bytes; the issue's upper-bound example
+_MAX_FRAME_BYTES = _read_positive_int_env("ATTENDANCE_MAX_FRAME_BYTES", _DEFAULT_MAX_FRAME_BYTES)
+
+# Internal error messages are kept generic by default; operators can opt in
+# to surfacing str(exception) on FAILURE/REVOKED task states for debugging.
+_REVEAL_INTERNAL_ERRORS = os.getenv("ATTENDANCE_REVEAL_INTERNAL_ERRORS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+# Task ownership is stored in Redis at enqueue time and consulted by the
+# status route. A 24h TTL covers the Celery result_expires window without
+# tailing the result backend forever. The UUID-string task_id is the key
+# suffix; collisions are bounded by the UUID v4 space.
+_TASK_OWNER_TTL_SECONDS = _read_positive_int_env("ATTENDANCE_TASK_OWNER_TTL_SECONDS", 86_400)
+_TASK_OWNER_KEY_PREFIX = "inference_task:owner"
+
+
+async def _set_task_owner(task_id: str, owner_id: UUID) -> None:
+    """Record the user who enqueued a task so the status route can authorize reads.
+
+    Best-effort: ownership cannot block enqueue — if Redis is unavailable the
+    task is still queued; the status route will then return 404 to all callers
+    (deny existence) rather than leak state. Logged, not raised.
+    """
+    try:
+        client = await get_redis_client()
+        await client.set(
+            f"{_TASK_OWNER_KEY_PREFIX}:{task_id}",
+            str(owner_id),
+            ex=_TASK_OWNER_TTL_SECONDS,
+        )
+    except Exception:
+        LOGGER.exception(
+            "Failed to record inference task owner for task_id=%s; status route will deny reads.",
+            task_id,
+        )
+
+
+async def _is_task_owner(task_id: str, user_id: UUID) -> bool:
+    """Return True iff the caller is the recorded owner of ``task_id``.
+
+    A missing owner key (TTL expired, Redis was unavailable at enqueue, or the
+    task predates the ownership mechanism) is treated as *not owner* — the
+    route then returns 404 to deny existence. Fail closed.
+    """
+    try:
+        client = await get_redis_client()
+        value = await client.get(f"{_TASK_OWNER_KEY_PREFIX}:{task_id}")
+    except Exception:
+        LOGGER.exception("Failed to query inference task owner for task_id=%s.", task_id)
+        return False
+
+    return bool(value) and value == str(user_id)
 
 
 def _enqueue_inference_batch(
@@ -46,7 +119,7 @@ def _enqueue_inference_batch(
     *,
     use_priority_queue: bool,
 ) -> InferenceTaskAccepted:
-    """Submit inference payload to Celery and return task metadata."""
+    """Submit inference payload to Celery and return task metadata (sync part)."""
     queue_name = "inference_priority" if use_priority_queue else "inference"
     routing_key = "inference.priority" if use_priority_queue else "inference.default"
 
@@ -82,7 +155,7 @@ def _enqueue_inference_batch(
     ),
 )
 async def enqueue_stream_inference(
-    _: CurrentUser,
+    current_user: CurrentUser,
     frame_file: Annotated[UploadFile, File(description="Raw frame tensor bytes.")],
     frame_id: Annotated[str, Form(min_length=1, max_length=128)],
     width: Annotated[int, Form(ge=1, le=4096)],
@@ -106,6 +179,18 @@ async def enqueue_stream_inference(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Uploaded frame_file is empty.",
+        )
+
+    if len(frame_bytes) > _MAX_FRAME_BYTES:
+        # An oversized declared shape (e.g. 4096x4096x4 float32 ~= 256 MiB)
+        # would otherwise pass schema validation and force a worker OOM. Cap
+        # at intake so the worker never allocates the array.
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Uploaded frame_file exceeds the maximum of {_MAX_FRAME_BYTES} bytes; "
+                f"reduce the declared tensor shape or raise ATTENDANCE_MAX_FRAME_BYTES."
+            ),
         )
 
     try:
@@ -136,7 +221,9 @@ async def enqueue_stream_inference(
             detail="Invalid frame tensor payload.",
         ) from exc
 
-    return _enqueue_inference_batch(batch_payload, use_priority_queue=priority)
+    accepted = _enqueue_inference_batch(batch_payload, use_priority_queue=priority)
+    await _set_task_owner(accepted.task_id, current_user.id)
+    return accepted
 
 
 @router.post(
@@ -147,12 +234,14 @@ async def enqueue_stream_inference(
     description="Enqueue a batch of validated image tensor frames for asynchronous inference processing.",
 )
 async def enqueue_batch_inference(
-    _: CurrentUser,
+    current_user: CurrentUser,
     payload: InferenceBatchRequest,
     priority: bool = False,
 ) -> InferenceTaskAccepted:
     """Accept a validated multi-frame payload and enqueue the asynchronous inference pipeline."""
-    return _enqueue_inference_batch(payload, use_priority_queue=priority)
+    accepted = _enqueue_inference_batch(payload, use_priority_queue=priority)
+    await _set_task_owner(accepted.task_id, current_user.id)
+    return accepted
 
 
 @router.get(
@@ -161,8 +250,19 @@ async def enqueue_batch_inference(
     summary="Get Inference Task Status",
     description="Retrieve Celery task state and optional result payload for a previously enqueued inference task.",
 )
-async def get_inference_task_status(_: CurrentUser, task_id: str) -> InferenceTaskStatus:
-    """Return execution state for a task ID from the Celery result backend."""
+async def get_inference_task_status(
+    current_user: CurrentUser,
+    task_id: str,
+) -> InferenceTaskStatus:
+    """Return execution state for a task ID from the Celery result backend.
+
+    Authorization: only the user who enqueued the task may read it (a per-task
+    owner:{user_id} key is written in Redis at enqueue time). Administrators
+    may read any task. A non-owner caller gets 404 (deny existence, not 403 —
+    a 403 would leak the existence of an unknown task ID). If the owner record
+    is missing (TTL expired, Redis was unavailable at enqueue), non-admin
+    callers are denied; admins are still allowed to read.
+    """
     try:
         task_result = celery_app.AsyncResult(task_id)
     except Exception as exc:
@@ -173,6 +273,15 @@ async def get_inference_task_status(_: CurrentUser, task_id: str) -> InferenceTa
         ) from exc
 
     state = task_result.state
+
+    is_admin = current_user.role == UserRole.ADMIN
+    if not is_admin and not await _is_task_owner(task_id, current_user.id):
+        # Deny existence: a 404 cannot be distinguished from "task never
+        # existed" by the caller.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No inference task found for that task_id.",
+        )
 
     if state == states.SUCCESS:
         if isinstance(task_result.result, dict):
@@ -185,24 +294,66 @@ async def get_inference_task_status(_: CurrentUser, task_id: str) -> InferenceTa
         )
 
     if state in {states.FAILURE, states.REVOKED}:
-        return InferenceTaskStatus(task_id=task_id, state=state, error=str(task_result.result))
+        error = (
+            str(task_result.result)
+            if _REVEAL_INTERNAL_ERRORS
+            else "Inference task failed; see server logs for details."
+        )
+        return InferenceTaskStatus(task_id=task_id, state=state, error=error)
 
     return InferenceTaskStatus(task_id=task_id, state=state)
 
 
+_EMBEDDING_DERIVED_KEYS: tuple[str, ...] = ("embedding", "identity", "matched_embedding_id")
+
+
 def _strip_embeddings_from_task_result(result: dict[str, object]) -> dict[str, object]:
-    """Defense-in-depth: scrub face embeddings before returning task results without ownership checks."""
+    """Defense-in-depth: scrub face embedding and embedding-derived pseudonyms.
+
+    Strips, per detection in ``results[]``:
+      - ``embedding``: the raw 512-D vector (the original concern).
+      - ``identity``: a 16-hex sha256-truncated digest of the embedding. This is
+        a stable pseudonymous identifier of an enrolled student — FERPA/BIPA
+        treats it as PII.
+      - ``matched_embedding_id``: the UUID of the matched StudentEmbedding row,
+        a stable pseudonym of an enrolled student's template.
+
+    All three are removed (set to ``None`` only if present in the source dict,
+    so as not to *add* keys the worker never wrote) before any task result is
+    returned to the API client. The realtime broadcast
+    (_publish_live_sighting_event in attendance_service.py) still ships
+    ``embedding_reference`` to subscribers — fixing that is out of this issue's
+    file scope; flagged in the B02 PR body.
+    """
     sanitized: dict[str, object] = dict(result)
     items = sanitized.get("results")
     if isinstance(items, list):
-        sanitized["results"] = [
-            {**item, "embedding": None} if isinstance(item, dict) and "embedding" in item else item
-            for item in items
-        ]
+        def _scrub(item: object) -> object:
+            if not isinstance(item, dict):
+                return item
+            stripped = dict(item)
+            for key in _EMBEDDING_DERIVED_KEYS:
+                if key in stripped:
+                    stripped[key] = None
+            return stripped
+
+        sanitized["results"] = [_scrub(item) for item in items]
     return sanitized
 
 
 _MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _decode_photo_to_tensor(raw_bytes: bytes) -> Image.Image:
+    """Decode JPEG/PNG bytes to RGB PIL and to a uint8 HxWx3 numpy array (CPU-bound).
+
+    This is CPU-bound work (typically 200–800 ms for a 10 MB JPEG) and must
+    NOT run on the FastAPI event loop — keeping it there stalls every other
+    request, including /healthz, the WebSocket keepalive, and the realtime
+    broadcast fan-out. The caller is expected to run this via asyncio.to_thread.
+    """
+    pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    return pil_image
 
 
 @router.post(
@@ -237,7 +388,7 @@ async def recognize_photo(
         )
 
     try:
-        pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_image = await asyncio.to_thread(_decode_photo_to_tensor, raw_bytes)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -245,8 +396,7 @@ async def recognize_photo(
         ) from exc
 
     width, height = pil_image.size
-    frame_array = np.asarray(pil_image, dtype=np.uint8)
-    frame_bytes = frame_array.tobytes()
+    frame_bytes = await asyncio.to_thread(lambda: np.asarray(pil_image, dtype=np.uint8).tobytes())
 
     now = datetime.now(tz=UTC)
     frame_payload = ImageTensorPayload(
