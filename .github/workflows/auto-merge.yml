@@ -62,9 +62,18 @@ jobs:
           # and every RBAC guard. Application code must not reach production
           # without a human reading it; a dependency bump already could not.
           #
+          # backend/tests/ is protected for a different reason: without it, an
+          # agent could turn a red required check green by deleting the test that
+          # was failing, and that deletion would itself auto-merge. A gate whose
+          # own tests can be edited unreviewed is not a gate.
+          #
+          # constraints.txt pins the entire resolved dependency set. It is a deps
+          # manifest exactly like pyproject.toml beside it, and an unreviewed pin
+          # bump can change what every future CI run actually installs.
+          #
           # docker-compose.prod.yml was previously unprotected while the .dev
           # variant was covered.
-          if echo "$changed" | grep -E '^(\.github/|backend/alembic|backend/alembic\.ini|backend/app/|pyproject\.toml|frontend/package(-lock)?\.json|scripts/|infra/|docker-compose\.dev\.yml|docker-compose\.prod\.yml|CODEOWNERS)' > /dev/null; then
+          if echo "$changed" | grep -E '^(\.github/|backend/alembic|backend/alembic\.ini|backend/app/|backend/tests/|pyproject\.toml|constraints\.txt|frontend/package(-lock)?\.json|scripts/|infra/|docker-compose\.dev\.yml|docker-compose\.prod\.yml|CODEOWNERS)' > /dev/null; then
             echo "PR modifies a CODEOWNERS-protected path. Refusing to auto-merge." >&2
             echo "should_merge=false" >> "$GITHUB_OUTPUT"
             exit 0
