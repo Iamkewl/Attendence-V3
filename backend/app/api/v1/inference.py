@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
@@ -28,17 +29,34 @@ from app.domain.schemas import (
     RecognitionMatch,
     RecognitionPhotoResponse,
 )
-from app.services.pipeline_service import process_inference_batch
-from app.worker.celery_app import celery_app
-from app.worker.tasks import run_inference_pipeline
 from app.infrastructure.triton import (
     TritonClientError,
 )
-
+from app.services.pipeline_service import process_inference_batch
+from app.worker.celery_app import celery_app
+from app.worker.tasks import run_inference_pipeline
 
 LOGGER = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/inference", tags=["Inference"])
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    """Read an int env var; reject zero/negative/non-int values (default when unset)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be an integer.") from exc
+    if value < 1:
+        raise RuntimeError(f"Environment variable {name} must be a positive integer.")
+    return value
+
+
+_DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024  # 4 MiB raw tensor bytes; the issue's upper-bound example
+_MAX_FRAME_BYTES = _read_positive_int_env("ATTENDANCE_MAX_FRAME_BYTES", _DEFAULT_MAX_FRAME_BYTES)
 
 
 def _enqueue_inference_batch(
@@ -106,6 +124,18 @@ async def enqueue_stream_inference(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Uploaded frame_file is empty.",
+        )
+
+    if len(frame_bytes) > _MAX_FRAME_BYTES:
+        # An oversized declared shape (e.g. 4096x4096x4 float32 ~= 256 MiB)
+        # would otherwise pass schema validation and force a worker OOM. Cap
+        # at intake so the worker never allocates the array.
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Uploaded frame_file exceeds the maximum of {_MAX_FRAME_BYTES} bytes; "
+                f"reduce the declared tensor shape or raise ATTENDANCE_MAX_FRAME_BYTES."
+            ),
         )
 
     try:
