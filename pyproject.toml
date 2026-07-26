@@ -3,9 +3,9 @@ requires = ["setuptools>=70.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "attendance-v2-backend"
+name = "attendance-v3-backend"
 version = "0.1.0"
-description = "Phase 2 security-hardened backend shell for the V2 Attendance System"
+description = "Phase 3 security-hardened backend for the Attendance V3 system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
