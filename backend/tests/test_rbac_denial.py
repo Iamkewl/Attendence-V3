@@ -23,6 +23,13 @@ workstream; not fixed here). It is used below purely as "a caller who is
 neither ADMIN nor INSTRUCTOR" -- comments call out the AUDITOR role
 explicitly wherever `student_user` is referenced, to avoid perpetuating the
 mislabel in new code.
+
+Implementation note: role fixtures are always requested directly as normal
+test parameters (never via `request.getfixturevalue()`). The latter does
+not reliably resolve async fixtures from inside an already-running async
+test under pytest-asyncio and raises
+`RuntimeError: There is no current event loop in thread 'MainThread'` --
+confirmed against this suite's actual CI run before landing this version.
 """
 
 from __future__ import annotations
@@ -96,14 +103,6 @@ INSTRUCTOR_PLUS_ROUTES = [
     ),
 ]
 
-# Fixture names (from conftest.py) for every role that must be refused by
-# CurrentAdminUser -- i.e. everyone except ADMIN.
-NON_ADMIN_ROLE_FIXTURES = ["instructor_user", "operator_user", "student_user"]
-
-# Fixture names for every role that must be refused by CurrentInstructorUser
-# -- i.e. everyone except ADMIN/INSTRUCTOR.
-NON_INSTRUCTOR_ROLE_FIXTURES = ["operator_user", "student_user"]
-
 # A representative guarded route per tier, used for the unauthenticated
 # (no cookie at all) 401 checks.
 UNAUTHENTICATED_ROUTES = [
@@ -118,55 +117,123 @@ UNAUTHENTICATED_ROUTES = [
 ]
 
 
-@pytest.mark.parametrize("role_fixture", NON_ADMIN_ROLE_FIXTURES)
+async def _assert_status(
+    async_client: AsyncClient,
+    method: str,
+    path: str,
+    kwargs: dict,
+    expected_status: int,
+    *,
+    cookies: dict | None = None,
+    role_label: str = "unauthenticated",
+) -> None:
+    response = await async_client.request(method, path, cookies=cookies, **kwargs)
+    assert response.status_code == expected_status, (
+        f"{method} {path} as {role_label} expected {expected_status}, got "
+        f"{response.status_code}: {response.text}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADMIN-only routes: every non-ADMIN role must be refused with 403.
+# Three dedicated test functions (one per non-admin role) rather than a
+# fixture-name parametrize, so every role fixture is requested directly and
+# resolved by pytest-asyncio in the normal way (see module docstring).
+# ---------------------------------------------------------------------------
+
 @pytest.mark.parametrize("method,path,kwargs", ADMIN_ONLY_ROUTES)
 @pytest.mark.asyncio
-async def test_admin_only_route_denies_non_admin_role(
-    request: pytest.FixtureRequest,
+async def test_admin_only_route_denies_instructor(
     async_client: AsyncClient,
+    instructor_user,
     auth_cookie,
     method: str,
     path: str,
     kwargs: dict,
-    role_fixture: str,
 ) -> None:
-    """A caller who is not ADMIN must be refused with 403 on an ADMIN-only route.
-
-    Covers INSTRUCTOR, OPERATOR, and AUDITOR (via the `student_user` fixture)
-    against every CurrentAdminUser route in users.py and students.py.
-    """
-    caller = request.getfixturevalue(role_fixture)
-    response = await async_client.request(method, path, cookies=auth_cookie(caller), **kwargs)
-    assert response.status_code == 403, (
-        f"{method} {path} as role={caller.role!s} ({role_fixture}) expected 403, "
-        f"got {response.status_code}: {response.text}"
+    """INSTRUCTOR is privileged but is not ADMIN -- must still be refused."""
+    await _assert_status(
+        async_client, method, path, kwargs, 403,
+        cookies=auth_cookie(instructor_user), role_label="INSTRUCTOR",
     )
 
 
-@pytest.mark.parametrize("role_fixture", NON_INSTRUCTOR_ROLE_FIXTURES)
+@pytest.mark.parametrize("method,path,kwargs", ADMIN_ONLY_ROUTES)
+@pytest.mark.asyncio
+async def test_admin_only_route_denies_operator(
+    async_client: AsyncClient,
+    operator_user,
+    auth_cookie,
+    method: str,
+    path: str,
+    kwargs: dict,
+) -> None:
+    """OPERATOR must be refused on ADMIN-only routes."""
+    await _assert_status(
+        async_client, method, path, kwargs, 403,
+        cookies=auth_cookie(operator_user), role_label="OPERATOR",
+    )
+
+
+@pytest.mark.parametrize("method,path,kwargs", ADMIN_ONLY_ROUTES)
+@pytest.mark.asyncio
+async def test_admin_only_route_denies_auditor(
+    async_client: AsyncClient,
+    student_user,  # ATT-031: this fixture actually provisions an AUDITOR account.
+    auth_cookie,
+    method: str,
+    path: str,
+    kwargs: dict,
+) -> None:
+    """AUDITOR must be refused on ADMIN-only routes."""
+    await _assert_status(
+        async_client, method, path, kwargs, 403,
+        cookies=auth_cookie(student_user), role_label="AUDITOR",
+    )
+
+
+# ---------------------------------------------------------------------------
+# INSTRUCTOR-plus routes (ADMIN or INSTRUCTOR): OPERATOR and AUDITOR must be
+# refused.
+# ---------------------------------------------------------------------------
+
 @pytest.mark.parametrize("method,path,kwargs", INSTRUCTOR_PLUS_ROUTES)
 @pytest.mark.asyncio
-async def test_instructor_plus_route_denies_lower_role(
-    request: pytest.FixtureRequest,
+async def test_instructor_plus_route_denies_operator(
     async_client: AsyncClient,
+    operator_user,
     auth_cookie,
     method: str,
     path: str,
     kwargs: dict,
-    role_fixture: str,
 ) -> None:
-    """A caller who is neither ADMIN nor INSTRUCTOR must be refused with 403.
-
-    Covers OPERATOR and AUDITOR (via the `student_user` fixture) against
-    every CurrentInstructorUser route in students.py and inference.py.
-    """
-    caller = request.getfixturevalue(role_fixture)
-    response = await async_client.request(method, path, cookies=auth_cookie(caller), **kwargs)
-    assert response.status_code == 403, (
-        f"{method} {path} as role={caller.role!s} ({role_fixture}) expected 403, "
-        f"got {response.status_code}: {response.text}"
+    """OPERATOR must be refused on CurrentInstructorUser routes."""
+    await _assert_status(
+        async_client, method, path, kwargs, 403,
+        cookies=auth_cookie(operator_user), role_label="OPERATOR",
     )
 
+
+@pytest.mark.parametrize("method,path,kwargs", INSTRUCTOR_PLUS_ROUTES)
+@pytest.mark.asyncio
+async def test_instructor_plus_route_denies_auditor(
+    async_client: AsyncClient,
+    student_user,  # ATT-031: this fixture actually provisions an AUDITOR account.
+    auth_cookie,
+    method: str,
+    path: str,
+    kwargs: dict,
+) -> None:
+    """AUDITOR must be refused on CurrentInstructorUser routes."""
+    await _assert_status(
+        async_client, method, path, kwargs, 403,
+        cookies=auth_cookie(student_user), role_label="AUDITOR",
+    )
+
+
+# ---------------------------------------------------------------------------
+# No credentials at all -> 401, not silently allowed through.
+# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("method,path,kwargs", UNAUTHENTICATED_ROUTES)
 @pytest.mark.asyncio
@@ -176,9 +243,4 @@ async def test_guarded_route_denies_unauthenticated_caller(
     path: str,
     kwargs: dict,
 ) -> None:
-    """No credentials at all must be refused with 401, not silently allowed through."""
-    response = await async_client.request(method, path, **kwargs)
-    assert response.status_code == 401, (
-        f"{method} {path} with no credentials expected 401, got "
-        f"{response.status_code}: {response.text}"
-    )
+    await _assert_status(async_client, method, path, kwargs, 401, cookies=None)
