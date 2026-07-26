@@ -221,15 +221,40 @@ async def get_inference_task_status(_: CurrentUser, task_id: str) -> InferenceTa
     return InferenceTaskStatus(task_id=task_id, state=state)
 
 
+_EMBEDDING_DERIVED_KEYS: tuple[str, ...] = ("embedding", "identity", "matched_embedding_id")
+
+
 def _strip_embeddings_from_task_result(result: dict[str, object]) -> dict[str, object]:
-    """Defense-in-depth: scrub face embeddings before returning task results without ownership checks."""
+    """Defense-in-depth: scrub face embedding and embedding-derived pseudonyms.
+
+    Strips, per detection in ``results[]``:
+      - ``embedding``: the raw 512-D vector (the original concern).
+      - ``identity``: a 16-hex sha256-truncated digest of the embedding. This is
+        a stable pseudonymous identifier of an enrolled student — FERPA/BIPA
+        treats it as PII.
+      - ``matched_embedding_id``: the UUID of the matched StudentEmbedding row,
+        a stable pseudonym of an enrolled student's template.
+
+    All three are removed (set to ``None`` only if present in the source dict,
+    so as not to *add* keys the worker never wrote) before any task result is
+    returned to the API client. The realtime broadcast
+    (_publish_live_sighting_event in attendance_service.py) still ships
+    ``embedding_reference`` to subscribers — fixing that is out of this issue's
+    file scope; flagged in the B02 PR body.
+    """
     sanitized: dict[str, object] = dict(result)
     items = sanitized.get("results")
     if isinstance(items, list):
-        sanitized["results"] = [
-            {**item, "embedding": None} if isinstance(item, dict) and "embedding" in item else item
-            for item in items
-        ]
+        def _scrub(item: object) -> object:
+            if not isinstance(item, dict):
+                return item
+            stripped = dict(item)
+            for key in _EMBEDDING_DERIVED_KEYS:
+                if key in stripped:
+                    stripped[key] = None
+            return stripped
+
+        sanitized["results"] = [_scrub(item) for item in items]
     return sanitized
 
 
