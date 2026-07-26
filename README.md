@@ -47,7 +47,7 @@ Four subpackages were introduced in the Phase A refactor:
 - `app.services.pipeline` — the inference pipeline broken into focused modules: `settings`, `frame`, `detection`, `tracking`, `liveness`, `embedding`, `matching`, and `orchestrator`. The entry point for callers is the facade below.
 - `app.domain.models` — SQLAlchemy ORM model classes split into one file per entity (user, student, course, room, session, sighting, governance); `__init__.py` re-exports all public symbols so existing `from app.domain.models import X` imports continue to work.
 - `app.domain.schemas` — Pydantic request/response schemas split by domain area (user, student, course, attendance, inference, common); `__init__.py` re-exports all public symbols for backward compatibility.
-- `app.infrastructure.triton` — Triton HTTP/gRPC client and its settings model, extracted from the worker layer. Import from here, not from `app.worker.triton_client`.
+- `app.infrastructure.triton` — Triton HTTP/gRPC client and its settings model, extracted from the worker layer. Import Triton client utilities from here.
 
 Facade pattern: `app.services.pipeline_service` is a thin import-forwarding module. It does not contain logic; it re-exports the public surface of `app.services.pipeline` so call sites outside the subpackage use a stable single import path.
 
