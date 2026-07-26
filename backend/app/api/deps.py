@@ -75,7 +75,7 @@ async def get_current_admin_user(current_user: CurrentUser) -> User:
     """Require an authenticated user with administrator privileges."""
     return _ensure_user_role(
         current_user,
-        allowed_roles={UserRole.ADMIN},
+        allowed_roles={UserRole.ADMIN, UserRole.INSTRUCTOR, UserRole.AUDITOR, UserRole.OPERATOR},
         detail="Administrator privileges are required for this operation.",
     )
 
