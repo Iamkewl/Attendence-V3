@@ -126,10 +126,20 @@ async def _seed_student_with_template(
 # ---------------------------------------------------------------------------
 # The fixture generator itself must be correct, or every assertion below is
 # meaningless. Verify it independently of the database.
+#
+# NOTE: these two need no event loop and would naturally be written as plain
+# sync tests — but they MUST be async. Running any sync test before an async one
+# tears down the session-scoped event loop, after which every subsequent async
+# test dies with "RuntimeError: There is no current event loop in thread
+# 'MainThread'". The pre-existing suite only avoids this by alphabetical luck:
+# test_smoke_realtime.py holds the only sync tests and happens to sort last.
+# Filed separately as a harness defect; worked around here so this file does not
+# depend on its own filename sorting after everything else.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target", [1.0, 0.95, 0.86, 0.85, 0.84, 0.5, 0.0, -0.5])
-def test_vector_at_cosine_produces_the_requested_angle(target: float) -> None:
+async def test_vector_at_cosine_produces_the_requested_angle(target: float) -> None:
     reference = _unit_norm_vector(seed=REFERENCE_SEED)
     probe = vector_at_cosine(reference, target)
 
@@ -138,7 +148,8 @@ def test_vector_at_cosine_produces_the_requested_angle(target: float) -> None:
     assert actual == pytest.approx(target, abs=1e-5)
 
 
-def test_independent_random_vectors_are_near_orthogonal() -> None:
+@pytest.mark.asyncio
+async def test_independent_random_vectors_are_near_orthogonal() -> None:
     """Documents why seed-picking cannot produce a controlled similarity.
 
     Two independent random unit vectors in 512-D concentrate near cosine 0, so choosing a
