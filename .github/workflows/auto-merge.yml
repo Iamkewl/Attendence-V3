@@ -55,9 +55,16 @@ jobs:
           changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
           echo "Changed files:"
           echo "$changed"
-          # Any change under .github/, CODEOWNERS, alembic, deps manifests,
-          # scripts/, infra/, or compose files = human review required.
-          if echo "$changed" | grep -E '^(\.github/|backend/alembic|backend/alembic\.ini|pyproject\.toml|frontend/package(-lock)?\.json|scripts/|infra/|docker-compose\.dev\.yml|CODEOWNERS)' > /dev/null; then
+          # Any change under .github/, CODEOWNERS, alembic, application code,
+          # deps manifests, scripts/, infra/, or compose files = human review.
+          #
+          # backend/app/ covers the biometric pipeline, the 0.85 match threshold
+          # and every RBAC guard. Application code must not reach production
+          # without a human reading it; a dependency bump already could not.
+          #
+          # docker-compose.prod.yml was previously unprotected while the .dev
+          # variant was covered.
+          if echo "$changed" | grep -E '^(\.github/|backend/alembic|backend/alembic\.ini|backend/app/|pyproject\.toml|frontend/package(-lock)?\.json|scripts/|infra/|docker-compose\.dev\.yml|docker-compose\.prod\.yml|CODEOWNERS)' > /dev/null; then
             echo "PR modifies a CODEOWNERS-protected path. Refusing to auto-merge." >&2
             echo "should_merge=false" >> "$GITHUB_OUTPUT"
             exit 0
