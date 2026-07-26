@@ -68,10 +68,16 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
 
+      # -c constraints.txt pins the whole resolved set. Without it pip picks the
+      # newest-compatible release of every floating range on each run, so an
+      # upstream release that adds a new warning becomes a hard failure under
+      # filterwarnings=error with no change on our side. See constraints.txt.
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" -c constraints.txt
 
       - name: Run Alembic migrations
         working-directory: backend
