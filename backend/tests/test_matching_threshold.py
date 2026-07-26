@@ -154,6 +154,7 @@ def test_independent_random_vectors_are_near_orthogonal() -> None:
 # Batch path (raw SQL) — this is what production calls
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target_cosine,should_match", _THRESHOLD_CASES)
 async def test_batch_path_applies_threshold(
     test_engine: AsyncEngine,
@@ -196,6 +197,7 @@ async def test_batch_path_applies_threshold(
 # ORM path
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target_cosine,should_match", _THRESHOLD_CASES)
 async def test_orm_path_applies_threshold(
     test_engine: AsyncEngine,
@@ -228,6 +230,7 @@ async def test_orm_path_applies_threshold(
 # The two implementations must not drift apart (ATT-077)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target_cosine,should_match", _THRESHOLD_CASES)
 async def test_both_paths_agree(
     test_engine: AsyncEngine,
@@ -261,6 +264,7 @@ async def test_both_paths_agree(
 # Sign of the reported value
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_reported_value_is_similarity_not_distance(test_engine: AsyncEngine) -> None:
     """A near-identical face must report ~1.0, not ~0.0.
 
@@ -287,6 +291,7 @@ async def test_reported_value_is_similarity_not_distance(test_engine: AsyncEngin
 # Batch alignment — the batch path maps results back by rank
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_batch_attributes_each_probe_to_the_right_student(
     test_engine: AsyncEngine,
 ) -> None:
@@ -320,12 +325,14 @@ async def test_batch_attributes_each_probe_to_the_right_student(
     assert matches[3].student_id == student_b, "probe 3 was built against student B"
 
 
+@pytest.mark.asyncio
 async def test_empty_batch_returns_empty(test_engine: AsyncEngine) -> None:
     from app.services.pipeline.matching import _resolve_vector_matches
 
     assert await _resolve_vector_matches([]) == []
 
 
+@pytest.mark.asyncio
 async def test_no_active_template_yields_no_match(test_engine: AsyncEngine) -> None:
     """With nothing enrolled, a probe must be rejected rather than matched to nothing."""
     from app.services.pipeline.matching import _resolve_vector_matches
