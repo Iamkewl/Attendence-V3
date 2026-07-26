@@ -40,3 +40,4 @@ def downgrade() -> None:
         "ON student_embeddings USING ivfflat (embedding vector_cosine_ops) "
         "WITH (lists = 100);"
     )
+    op.drop_index("ix_does_not_exist", table_name="student_embeddings")
