@@ -127,7 +127,16 @@ async def _assert_status(
     cookies: dict | None = None,
     role_label: str = "unauthenticated",
 ) -> None:
-    response = await async_client.request(method, path, cookies=cookies, **kwargs)
+    # Send the session token as a Bearer header rather than as per-request
+    # cookies. httpx deprecated `cookies=` on individual requests, and
+    # filterwarnings = ["error"] promotes that DeprecationWarning to a failure.
+    # get_current_user accepts either (deps.py:27), and the bearer path also
+    # avoids leaking client-level cookie state between parametrized cases.
+    headers = dict(kwargs.pop("headers", {}))
+    if cookies:
+        headers["Authorization"] = f"Bearer {next(iter(cookies.values()))}"
+
+    response = await async_client.request(method, path, headers=headers, **kwargs)
     assert response.status_code == expected_status, (
         f"{method} {path} as {role_label} expected {expected_status}, got "
         f"{response.status_code}: {response.text}"
