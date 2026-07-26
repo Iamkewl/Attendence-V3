@@ -316,8 +316,8 @@ Notes:
 After starting the SSH tunnel:
 
 ```powershell
-curl.exe -s http://127.0.0.1:8000/v2/health/live
-curl.exe -s http://127.0.0.1:8000/v2/health/ready
+curl.exe -s http://127.0.0.1:8000/health
+curl.exe -s http://127.0.0.1:8000/ready
 ```
 
 Expected response for both: `OK`
