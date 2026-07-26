@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
@@ -235,6 +236,18 @@ def _strip_embeddings_from_task_result(result: dict[str, object]) -> dict[str, o
 _MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
+def _decode_photo_to_tensor(raw_bytes: bytes) -> Image.Image:
+    """Decode JPEG/PNG bytes to RGB PIL and to a uint8 HxWx3 numpy array (CPU-bound).
+
+    This is CPU-bound work (typically 200–800 ms for a 10 MB JPEG) and must
+    NOT run on the FastAPI event loop — keeping it there stalls every other
+    request, including /healthz, the WebSocket keepalive, and the realtime
+    broadcast fan-out. The caller is expected to run this via asyncio.to_thread.
+    """
+    pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    return pil_image
+
+
 @router.post(
     "/photo",
     response_model=RecognitionPhotoResponse,
@@ -267,7 +280,7 @@ async def recognize_photo(
         )
 
     try:
-        pil_image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_image = await asyncio.to_thread(_decode_photo_to_tensor, raw_bytes)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -275,8 +288,7 @@ async def recognize_photo(
         ) from exc
 
     width, height = pil_image.size
-    frame_array = np.asarray(pil_image, dtype=np.uint8)
-    frame_bytes = frame_array.tobytes()
+    frame_bytes = await asyncio.to_thread(lambda: np.asarray(pil_image, dtype=np.uint8).tobytes())
 
     now = datetime.now(tz=UTC)
     frame_payload = ImageTensorPayload(
