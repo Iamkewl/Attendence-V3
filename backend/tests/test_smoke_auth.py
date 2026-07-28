@@ -214,8 +214,13 @@ async def test_att_032_issue_ticket_does_not_construct_manager_per_call(
     body had `pubsub_manager = RedisPubSubManager()` which would call the
     patched ctor. Post-fix the endpoint body just reads the module singleton
     and never constructs.
+
+    Note: the httpx.ASGITransport client in conftest does NOT auto-persist
+    cookies across requests, so we capture the Set-Cookie pair from the
+    login response and forward them explicitly on the ws-ticket call.
     """
     import app.api.v1.auth as auth_module
+    from app.core.security import get_security_settings
 
     def _forbid(*args, **kwargs):
         raise AssertionError(
@@ -232,7 +237,20 @@ async def test_att_032_issue_ticket_does_not_construct_manager_per_call(
     )
     assert login_resp.status_code == 200, login_resp.text
 
-    response = await async_client.post("/api/v1/auth/ws-ticket")
+    settings = get_security_settings()
+    access_token = login_resp.cookies.get(settings.access_cookie_name)
+    refresh_token = login_resp.cookies.get(settings.refresh_cookie_name)
+    cookie_header_parts = []
+    if access_token:
+        cookie_header_parts.append(f"{settings.access_cookie_name}={access_token}")
+    if refresh_token:
+        cookie_header_parts.append(f"{settings.refresh_cookie_name}={refresh_token}")
+    cookies_for_ticket = "; ".join(cookie_header_parts)
+
+    response = await async_client.post(
+        "/api/v1/auth/ws-ticket",
+        headers={"Cookie": cookies_for_ticket},
+    )
     assert response.status_code == 200, response.text
     body = response.json()
     assert "ticket" in body
@@ -315,25 +333,36 @@ async def test_att_046_samesite_none_env_overrides_default(
     )
 
 
-@pytest.mark.asyncio
-async def test_att_046_invalid_samesite_env_fails_closed(
-    async_client: AsyncClient,
-    admin_user,
+def test_att_046_invalid_samesite_env_raises_runtime_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Invalid ATTENDANCE_COOKIE_SAMESITE reject the request rather than emit unsafe cookies.
+    """Invalid ATTENDANCE_COOKIE_SAMESITE must raise RuntimeError, not silently
+    fall back to a permissive mode.
 
-    The CVE-class risk here is the cookie flag silently defaulting to
-    `none` (or to anything else) when the operator's env var has a typo.
-    The validator raises RuntimeError so the app fails fast at cookie
-    emission time. The endpoint returns a 500-level error rather than
-    emitting unsafe cookies.
+    The CVE-class risk is the cookie flag silently defaulting to `none` (or
+    to anything else) when the operator's env var has a typo. Per the
+    fail-closed rule (§6), we verify the validator at the helper level
+    instead of through an HTTP roundtrip — the Starlette/AsyncClient stack
+    re-raises server exceptions in tests, so a returned-RuntimeError would
+    surface as an uncaught exception rather than a ≥400 status code.
     """
+    import app.api.v1.auth as auth_module
+
     monkeypatch.setenv("ATTENDANCE_COOKIE_SAMESITE", "l@x")
-    response = await async_client.post(
-        "/api/v1/auth/login",
-        json={"email": admin_user.email, "password": "TestPass1!"},
-    )
-    # Per the fail-closed rule for security fixes (§6): an invalid config
-    # must NOT silently fall back to a permissive mode.
-    assert response.status_code >= 400, response.text
+    with pytest.raises(RuntimeError, match="ATTENDANCE_COOKIE_SAMESITE"):
+        auth_module._read_cookie_samesite()
+
+
+def test_att_046_samesite_env_is_case_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ATTENDANCE_COOKIE_SAMESITE=LAX must normalize to 'lax' (case-fold).
+
+    Catches a regression that compares the env value verbatim and rejects
+    'LAX' as invalid (which would silently break an operator who set it in
+    upper-case).
+    """
+    import app.api.v1.auth as auth_module
+
+    monkeypatch.setenv("ATTENDANCE_COOKIE_SAMESITE", "LAX")
+    assert auth_module._read_cookie_samesite() == "lax"
