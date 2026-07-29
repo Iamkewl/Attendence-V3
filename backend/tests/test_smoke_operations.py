@@ -67,24 +67,22 @@ def test_att_021_probe_triton_uses_async_wrapper_source() -> None:
     Pre-fix the helper did `asyncio.get_event_loop().run_in_executor(None,
     client.assert_server_ready)`. Post-fix it does
     `await client.assert_server_ready_async()`.
+
+    AST-scoped assertion so the explanatory comment that names the old
+    pattern does not trip a substring check.
     """
     import inspect
 
     from app.api.operations import _probe_triton
 
-    src = inspect.getsource(_probe_triton)
+    src = textwrap.dedent(inspect.getsource(_probe_triton))
+    tree = ast.parse(src)
     assert _contains_call_to_async_wrapper_in_probe_triton(src), (
         "ATT-021: _probe_triton must call client.assert_server_ready_async() "
         "instead of asyncio.get_event_loop().run_in_executor(...) — the async "
         "wrapper is implemented on the client as `await asyncio.to_thread(...)`."
     )
-    # Substring check on the SHORT helper source (the comment that mentions
-    # the deprecated call also mentions `assert_server_ready_async`, so this
-    # substring check is meaningful: it asserts the call form, not the
-    # pattern-matched call form).
-    # The strict "no get_event_loop call anywhere" assertion is in
-    # test_att_021_no_get_event_loop_in_module (AST-scoped).
-    assert "asyncio.get_event_loop(" not in src, (
+    assert not _has_get_event_loop_call(tree), (
         "ATT-021: _probe_triton still makes the deprecated "
         "asyncio.get_event_loop() call. Use `await asyncio.to_thread(...)` "
         "or the per-client `assert_server_ready_async` wrapper."
