@@ -128,12 +128,93 @@ def _read_jwt_algorithm() -> str:
     return algorithm
 
 
+# ATT-042: minimum JWT secret strength — fail-fast at startup, not at first
+# verification. HS256 is symmetric: a low-entropy 1-byte secret means the
+# signature is brute-forceable offline by anyone who captures one token,
+# and a forged token can grant ADMIN rights over face-template enrollment
+# and attendance overrides (this is a biometric-attendance system). The
+# bookkeeping secret strength is len(encoded bytes) >= 32 (so a 1-character
+# multibyte-UTF-8 secret that occupies 4 bytes is still rejected — RFC 7518
+# §3.2 lists 256 bits as the floor for HS256 symmetric MAC keys).
+_JWT_SECRET_MIN_BYTES = 32
+
+# ATT-042: blocklist of documented placeholder strings — a rushed operator
+# pasting these from README/RUNBOOK produces a copy-paste-broken secret with
+# zero entropy (any internet search returns the same string and its cracked
+# signature). The blocklist is intentionally small and literal so it can't
+# accidentally match a real, randomly-generated secret. The comparison is
+# case-sensitive (matches the README/RUNBOOK wording exactly).
+#
+# Note: these strings all CLEAR the 32-byte minimum length check on their own
+# — that's the trap the blocklist closes. (E.g. `change-me-to-a-long-random-
+# secret` is 35 chars but every public reader of the repo knows it.)
+_JWT_SECRET_PLACEHOLDER_BLOCKLIST: frozenset[str] = frozenset(
+    {
+        "change-me-to-a-long-random-secret",
+        "dev-only-change-me-min-32-chars-needed",
+        "test-secret-32chars-minimum-needed",
+    }
+)
+
+
+def _read_and_validate_jwt_secret(env_name: str = "ATTENDANCE_JWT_SECRET") -> str:
+    """Read ATTENDANCE_JWT_SECRET and reject launch when too short or a known placeholder.
+
+    ATT-042 fails CLOSED. The two failure modes:
+
+      1. Length: `len(value.encode("utf-8")) < _JWT_SECRET_MIN_BYTES`
+         raises RuntimeError. This is the primary enforcement: RFC 7518 §3.2
+         cites 256 bits as the floor for HS256 symmetric MAC keys; 32 bytes
+         is exactly 256 bits.
+      2. Placeholder blocklist: `value in _JWT_SECRET_PLACEHOLDER_BLOCKLIST`
+         raises RuntimeError. The blocklist is the documented dev / example
+         placeholder strings — secrets that the entire internet knows. A
+         rushed operator copying from README/RUNBOOK produces these
+         verbatim; the blocklist refuses them even though some of them
+         pass the length check.
+
+    Both checks are case-sensitive literal comparisons. Crypto strength is
+    not measured beyond these two gates — a future passphrase with enough
+    entropy but a documented placeholder substring cannot be rejected by
+    automatic means without false-positives, so we leave that to RUNBOOK
+    guidance (use `secrets.token_urlsafe(32)` for prod).
+    """
+    value = os.getenv(env_name)
+    if value is None or not value.strip():
+        raise RuntimeError(f"Environment variable {env_name} must be set.")
+
+    secret = value.strip()
+
+    # Length check: byte-length, not char-length. A 1-char multibyte UTF-8
+    # secret occupies >1 byte but is still rejected below 32.
+    encoded_len = len(secret.encode("utf-8"))
+    if encoded_len < _JWT_SECRET_MIN_BYTES:
+        raise RuntimeError(
+            f"Environment variable {env_name} is too short: {encoded_len} "
+            f"bytes encoded, minimum is {_JWT_SECRET_MIN_BYTES} bytes "
+            f"(RFC 7518 §3.2: HS256 symmetric MAC keys should be >= 256 bits)."
+        )
+
+    # Placeholder blocklist: refuse the documented dev / README / RUNBOOK
+    # placeholders even if they pass the length check — they're widely
+    # known.
+    if secret in _JWT_SECRET_PLACEHOLDER_BLOCKLIST:
+        raise RuntimeError(
+            f"Environment variable {env_name} is a documented placeholder "
+            f"string and is publicly known. Generate a real secret with "
+            f"`python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`"
+            f" and set it as ATTENDANCE_JWT_SECRET before starting the app."
+        )
+
+    return secret
+
+
 @lru_cache(maxsize=1)
 def get_security_settings() -> SecuritySettings:
     """Return cached security settings with production-safe defaults."""
     cookie_domain = os.getenv("ATTENDANCE_COOKIE_DOMAIN")
     return SecuritySettings(
-        jwt_secret_key=_read_required_env("ATTENDANCE_JWT_SECRET"),
+        jwt_secret_key=_read_and_validate_jwt_secret("ATTENDANCE_JWT_SECRET"),
         jwt_algorithm=_read_jwt_algorithm(),
         jwt_issuer=os.getenv("ATTENDANCE_JWT_ISSUER", "attendance-v3-backend"),
         jwt_audience=os.getenv("ATTENDANCE_JWT_AUDIENCE", "attendance-v3-client"),
