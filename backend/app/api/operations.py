@@ -69,7 +69,7 @@ def _client_addr_loopback(request: Request) -> bool:
     return host in {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
 
 
-@router.get("/health", include_in_schema=True)
+@router.get("/health", include_in_schema=True, response_model=None)
 async def health(request: Request) -> dict[str, str] | JSONResponse:
     if _ops_require_loopback() and not _client_addr_loopback(request):
         return JSONResponse(
@@ -142,7 +142,7 @@ async def _probe_triton() -> dict[str, object]:
         return {"ok": False, "mode": "live", "latency_ms": latency_ms, "error": ERROR_GENERIC_TRITON}
 
 
-@router.get("/ready", include_in_schema=True)
+@router.get("/ready", include_in_schema=True, response_model=None)
 async def ready(request: Request) -> JSONResponse:
     # ATT-022 opt-in: only refuse when the env flag is set. k8s probes hit
     # /ready from loopback so this doesn't break them by default.
@@ -182,7 +182,7 @@ async def ready(request: Request) -> JSONResponse:
     return JSONResponse(content=body, status_code=http_status)
 
 
-@router.get("/version", include_in_schema=True)
+@router.get("/version", include_in_schema=True, response_model=None)
 async def version(request: Request) -> dict[str, str] | JSONResponse:
     if _ops_require_loopback() and not _client_addr_loopback(request):
         return JSONResponse(
