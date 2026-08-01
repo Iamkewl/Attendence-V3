@@ -63,16 +63,22 @@ def _mk_detection(
 
 def test_att_028_docstring_does_not_claim_iou() -> None:
     """The pre-fix module docstring said 'IoU-based' but no IoU computation
-    ever existed in tracking.py. That lie is now gone.
+    ever existed in tracking.py. That false descriptive claim is now gone.
     """
     src = _TRACKING_PY_PATH.read_text(encoding="utf-8")
-    # Word-boundary case-sensitive check for "IoU" / "IOU".
-    # 'IoU' is not a Python keyword or any plotting utility name we'd want
-    # to permit here. If a maintainer genuinely needs the literal text in
-    # an unrelated comment, they'd have to re-evaluate this pin.
+    # Word-boundary case-sensitive check for "IoU". The pre-fix docstring
+    # said "IoU-based nearest-centroid temporal tracker". The post-fix
+    # docstring should NOT use the false descriptive claim anywhere — the
+    # module + function docstrings now describe the actual algorithm
+    # (centroid Euclidean distance) without invoking the false claim.
+    # Explanatory comments resolving the historical lie use the descriptive
+    # phrase "intersection-over-union" — see lines near the bottom of the
+    # function docstring.
     assert "IoU" not in src, (
         "tracking.py must not claim 'IoU'-based tracking (no IoU computation "
-        "ever existed in this module — the truth is pure centroid distance)."
+        "ever existed in this module — the truth is pure centroid distance). "
+        "If explanatory text discusses the historical lie, use the descriptive "
+        "phrase 'intersection-over-union' rather than the abbreviation 'IoU'."
     )
 
 

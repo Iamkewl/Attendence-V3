@@ -1,13 +1,15 @@
 """Centroid-distance temporal tracker for within-batch face association.
 
-ATT-028 (Medium): The legacy docstring lied — it said "IoU-based" but the
-implementation has always been pure centroid Euclidean distance with no IoU
-computation. This is now reflected in the module + function docstrings.
+ATT-028 (Medium): The pre-fix module docstring falsely described this
+module as 'intersection-over-union'-based, but no such computation ever
+existed here. The tracker has always been pure centroid Euclidean
+distance. The module + function docstrings now reflect that.
 
-Per the issue's ACCEPT, the docstring says "centroid", not "IoU"; and a
-camera that emits two single-frame batches 5 seconds apart, where both
-frames contain the same face area, gets the same `track_id` (or the sentinel
-`_SINGLE_FRAME_NO_TRACK_ID` if no persistent cross-batch buffer is wired up).
+Per the issue's ACCEPT, the docstring says 'centroid', not the
+intersection-over-union claim; and a camera that emits two single-frame
+batches 5 seconds apart, where both frames contain the same face area,
+gets the same `track_id` (or the sentinel `_SINGLE_FRAME_NO_TRACK_ID`
+if no persistent cross-batch buffer is wired up).
 
 This file's B23-owned scope is JUST the tracker itself. Cross-batch
 persistent-tracking (option (b) of the FIX: rolling per-camera centroid
@@ -31,8 +33,8 @@ files is:
     operator who DOES submit video multi-frame sequences per batch still
     gets the within-batch linkage).
 
-  - Fix the docstring accuracy (centroid, not IoU) per the issue's literal
-    ACCEPT.
+  - Fix the docstring accuracy (centroid, not the union-of-areas claim) per
+    the issue's literal ACCEPT.
 """
 
 from __future__ import annotations
@@ -101,9 +103,10 @@ def _track_detections(
       (cross-batch follow-up — needs orchestrator + settings + state
       store), the sentinel 0 is the "no track_id" branch.
 
-    NOTE: "Centroid" not "IoU" — historically the module docstring claimed
-    "IoU-based" but no IoU computation ever existed; this tracker is pure
-    centroid Euclidean distance, as reflected here.
+    NOTE: "Centroid" not intersection-over-union — historically the module
+    docstring claimed union-of-areas matching, but no such computation ever
+    existed here; this tracker is pure centroid Euclidean distance, as
+    reflected here.
     """
     # ATT-028: single-frame-batch short-circuit. For the documented
     # production periodic-CCTV model (5-60 s cadence → one frame per batch),
