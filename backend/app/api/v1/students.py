@@ -296,7 +296,15 @@ async def enroll_student_template(
             min_quality,
         )
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            # ATT-029 note: use HTTP_422_UNPROCESSABLE_CONTENT (the new
+            # starlette 1.x name) — the older HTTP_422_UNPROCESSABLE_ENTITY
+            # fires StarletteDeprecationWarning, which pyproject.toml
+            # promotes to an error via filterwarnings=["error"]. The other
+            # call sites in students.py (lines 101, 106) still use the old
+            # name because no test exercises those routes in a way that
+            # hits the constant; touching them now would broaden the diff
+            # beyond B26's owned scope.
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"Image quality too low for enrollment "
                 f"(quality={quality_score:.4f}, minimum={min_quality:.4f}). "
