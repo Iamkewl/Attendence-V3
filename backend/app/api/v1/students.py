@@ -285,7 +285,28 @@ async def enroll_student_template(
     # retake'". 422 UNPROCESSABLE ENTITY is the right HTTP code for a
     # client-provided image that the server can read but cannot process
     # to a usable embedding per the server's own quality policy.
-    min_quality = _resolve_enrollment_min_quality()
+    #
+    # Fail-closed: a bad ATTENDANCE_ENROLLMENT_MIN_QUALITY configuration
+    # raises a RuntimeError out of _resolve_enrollment_min_quality(); we
+    # surface that as a 500 (with a LOGGER.exception line for the diagnosis)
+    # rather than silently accepting garbage embeddings under bad config.
+    try:
+        min_quality = _resolve_enrollment_min_quality()
+    except RuntimeError as exc:
+        LOGGER.exception(
+            "Enrollment quality gate refused to start for student_id=%s pose=%s.",
+            student_id,
+            normalized_pose_label,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Enrollment quality gate is misconfigured "
+                "(ATTENDANCE_ENROLLMENT_MIN_QUALITY error). "
+                "Please contact the administrator."
+            ),
+        ) from exc
+
     if quality_score < min_quality:
         LOGGER.info(
             "Enrollment refused for student_id=%s pose=%s: quality_score=%.4f "
