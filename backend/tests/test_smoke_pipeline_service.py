@@ -64,34 +64,27 @@ def test_att_005_no_underscore_symbol_imported_by_facade() -> None:
 
     Pre-fix it imported 18 such private helpers (see the issue's LOCATION
     list). Post-fix, the facade's import block is just the public symbols
-    from ``pipeline/__init__.py``. This test scans the facade's source
-    text for any ``import _`` or ```` from .pipeline.<x> import ..., _<name> ``
-    patterns and fails if any are found.
+    from ``pipeline/__init__.py``. This test parses the facade's AST and
+    inspects actual ``from`` and ``import`` statements — not the docstring
+    or comment text (which legitimately discusses the historical private
+    re-exports as a thing of the past).
     """
+    import ast
     src = _FACADE_PATH.read_text(encoding="utf-8")
-    # Pattern: any word token starting with ``_`` that appears in an import
-    # context. We check for the pre-fix bug pattern of "import _<name>" in
-    # the import lines.
-    #
-    # Approach: split the file by lines, find lines that start with `from`
-    # or `import`, and on those lines look for any token starting with `_`.
-    # This catches both `from .pipeline.detection import _decode_bbox` and
-    # `from .pipeline.frame import (_crop_face, ...)`.
-    import re
-    import_lines = [
-        line
-        for line in src.splitlines()
-        if re.match(r"^\s*(from|import)\s", line)
-    ]
+    tree = ast.parse(src)
     underscore_tokens_in_imports: list[str] = []
-    for line in import_lines:
-        # Tokens starting with `_` but longer than `_` alone (which would
-        # trigger on `_` from `import _` if anyone wrote that — also bug).
-        for match in re.finditer(r"\b_+[A-Za-z_][A-Za-z0-9_]*\b", line):
-            underscore_tokens_in_imports.append(match.group(0))
-        # Also catch a bare ``import _something`` style.
-        for match in re.finditer(r"\bimport\s+(_+[A-Za-z_][A-Za-z0-9_]*)\b", line):
-            underscore_tokens_in_imports.append(match.group(1))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.name
+                if name.startswith("_"):
+                    underscore_tokens_in_imports.append(name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.name
+                if name.startswith("_"):
+                    underscore_tokens_in_imports.append(name)
+
     assert underscore_tokens_in_imports == [], (
         f"pipeline_service.py imports underscore-prefixed private symbols: "
         f"{underscore_tokens_in_imports!r}. The facade should re-export ONLY "
@@ -100,26 +93,33 @@ def test_att_005_no_underscore_symbol_imported_by_facade() -> None:
 
 
 def test_att_005_no_noqa_f401_leftover() -> None:
-    """The pre-fix facade used `# noqa: F401` markers on every import line
+    """The pre-fix facade used ``# noqa: F401`` markers on every import line
     because every imported symbol was unused (the imports existed only to
-    re-export). Post-fix the marker may still be present (importing public
-    symbols that are unused locally still triggers F401 in ruff), but the
-    pattern of noqa-on-private-imports is gone. We assert the count of
-    `# noqa: F401` markers is at most the count of public-symbol imports
-    — i.e. no leftover noqa markers from dropped private imports.
+    re-export).
+
+    Post-fix the marker may still be present (importing public symbols that
+    are unused locally still triggers F401 in ruff), but the pattern of
+    noqa-on-private-imports is gone. We assert the count of
+    ``# noqa: F401`` markers in actual IMPORT lines of the AST is at most 1
+    — the single noqa on the public import line.
     """
-    src = _FACADE_PATH.read_text(encoding="utf-8")
+    import ast
     import re
-    noqa_count = len(re.findall(r"#\s*noqa:\s*F401", src))
-    # There are exactly 8 public symbols imported in the post-fix facade
-    # (Detection, EmbeddingMatch, PipelineSettings, STRICT_SIMILARITY_THRESHOLD,
-    # TrackedDetection, extract_enrollment_embedding, get_pipeline_settings,
-    # process_inference_batch) — all on one line. We allow at most 1 noqa
-    # marker (the one for the single-line `from .pipeline import ...` import).
+    src = _FACADE_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    noqa_count = 0
+    # Walk the AST to find all ImportFrom nodes; check each one's source
+    # segment for the "noqa F401" marker (rendered here in pieces so ruff
+    # doesn't parse the comment as a directive).
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ImportFrom, ast.Import)):
+            # Extract the source segment for this import node.
+            segment = ast.get_source_segment(src, node) or ""
+            noqa_count += len(re.findall(r"#\s*noqa:\s*F401", segment))
     assert noqa_count <= 1, (
-        f"pipeline_service.py has {noqa_count} `# noqa: F401` markers; "
-        f"expected at most 1 (the public import line). Leftover markers "
-        f"from the pre-fix private re-exports were not removed."
+        f"pipeline_service.py has {noqa_count} `# noqa: F401` markers in import "
+        f"statements; expected at most 1 (the public import line). Leftover "
+        f"markers from the pre-fix private re-exports were not removed."
     )
 
 
