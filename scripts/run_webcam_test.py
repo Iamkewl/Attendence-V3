@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture laptop webcam frames and stream them to the V2 inference endpoint."""
+"""Capture laptop webcam frames and stream them to the Attendance V3 inference /stream endpoint."""
 
 from __future__ import annotations
 
