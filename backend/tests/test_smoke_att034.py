@@ -18,7 +18,7 @@ import pathlib
 import re
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[3]
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 RECOGNIZE_PATH = ROOT / "frontend" / "src" / "pages" / "Recognize.jsx"
 
 
