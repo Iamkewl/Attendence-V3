@@ -271,8 +271,13 @@ export default function Recognize() {
     formData.append('file', selectedFile)
 
     try {
+      // ATT-034: do not set `Content-Type: 'multipart/form-data'` manually.
+      // Doing so strips the `boundary=...` parameter that axios computes
+      // from the FormData body; python-multipart (FastAPI/Starlette) then
+      // rejects the request with "no boundary found" / 422. Letting axios
+      // infer the header means the request is sent with
+      // `multipart/form-data; boundary=...` as required.
       const response = await client.post(RECOGNIZE_ENDPOINT, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 60000,
       })
       setResult(response.data)
