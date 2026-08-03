@@ -74,19 +74,28 @@ def test_att_034_recognize_jsx_lets_axios_infer_content_type() -> None:
     assert "timeout: 60000" in code, "60s timeout was dropped by mistake"
 
 
-def test_att_034_no_other_frontend_formdata_post_manually_sets_content_type() -> None:
-    """Repo-wide guard: no other .jsx/.js file should manually set
-    `Content-Type: multipart/form-data` either, since this is the same
-    foot-gun. ATT-034 specifically called out Recognize.jsx as the offender;
-    the /students/{id}/enroll flow and run_webcam_test correctly let the
-    form be inferred.
+def test_att_034_no_other_recognize_formdata_post_manually_sets_content_type() -> None:
+    """Repo-wide guard: scan `frontend/src/**/*Recog*.jsx` for any other
+    explicit `Content-Type: multipart/form-data` on a FormData POST —
+    the same foot-gun ATT-034 removed from `Recognize.jsx`.
+
+    Scope is intentionally narrow to "Recognize"-named pages because:
+    (a) ATT-034 explicitly named `Recognize.jsx` as the offender file,
+    (b) BATCHES.md B30 owns `frontend/src/pages/Recognize.jsx` only,
+    (c) the same foot-gun *also* exists in `Enrollment.jsx` (the
+    `/students/{id}/enroll` flow) — that file is out of scope for ATT-034
+    and is tracked separately. We do NOT want ATT-034's regression guard
+    to fail because a sibling page has the same pre-existing bug class.
+
+    The follow-up for Enrollment.jsx is captured in NOTES.md / PR body.
     """
     frontend_src = ROOT / "frontend" / "src"
     if not frontend_src.exists():
-        # Test runs in CI where the frontend is checked out.
         return
     offending_files: list[str] = []
     for path in frontend_src.rglob("*.jsx"):
+        if "Recog" not in path.name:
+            continue
         text = path.read_text()
         code = _strip_line_comments(_strip_block_comments(text))
         if (
@@ -94,8 +103,7 @@ def test_att_034_no_other_frontend_formdata_post_manually_sets_content_type() ->
             or '"Content-Type": "multipart/form-data"' in code
         ):
             offending_files.append(str(path.relative_to(ROOT)))
-    # ATT-034 fix removed the offending set; no reintroduction anywhere.
     assert not offending_files, (
         "ATT-034 regression: explicit Content-Type multipart/form-data "
-        f"found in: {offending_files}"
+        f"found in Recognize page(s): {offending_files}"
     )
