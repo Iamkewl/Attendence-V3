@@ -294,15 +294,14 @@ $env:ATTENDANCE_TRITON_URL = "fake-host:8001"   # Triton is faked in tests
 python -m pytest
 ```
 
-Expected: `8 passed` over the 5 smoke files (`test_smoke_aggregation.py`,
-`test_smoke_auth.py`, `test_smoke_inference.py`, `test_smoke_integration.py`,
-`test_smoke_realtime.py`).
+The suite grows as fixes land — don't trust a hardcoded count (earlier docs
+claimed "7 passed", then "8 passed"; both went stale). Run it and read the
+summary line. Current scope: happy-path flows plus regression tests for
+pipeline math edge cases and RBAC denials.
 
-> **Coverage scope.** These are 8 happy-path flow tests, **not** exhaustive
-> coverage. They do not exercise the pipeline's math edge cases, RBAC denials,
-> the cross-loop engine disposal guard (ATT-011), or the frontend. Two
-> follow-ups widen the bar: ATT-051 (real Celery worker in the smoke suite) and
-> ATT-053 (frontend automated tests).
+> **Coverage scope.** These are smoke tests, **not** exhaustive coverage. They
+> do not exercise the pipeline's math edge cases in production conditions,
+> a real Celery worker (ATT-051), or the frontend (ATT-053).
 
 Triton is replaced by `FakeTritonGrpcClient` via the
 `set_triton_client_override()` test seam — no real GPU is required.
