@@ -129,12 +129,12 @@ if (-not (Test-Path -Path (Join-Path -Path $backendDir -ChildPath 'alembic.ini')
 if ($UseExistingEnvironment) {
     Set-DefaultEnvVar -Name 'ATTENDANCE_DATABASE_URL' -Value 'postgresql+asyncpg://attendance:attendance@localhost:15432/attendance'
     Set-DefaultEnvVar -Name 'ATTENDANCE_REDIS_URL' -Value 'redis://localhost:6379/0'
-    Set-DefaultEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me-min-32-chars-needed'
+    Set-DefaultEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me-this-is-at-least-32b'
     Set-DefaultEnvVar -Name 'ATTENDANCE_ALLOWED_ORIGINS' -Value 'http://localhost:5173,http://localhost:3000,http://localhost:8000'
 } else {
     Set-ProcessEnvVar -Name 'ATTENDANCE_DATABASE_URL' -Value 'postgresql+asyncpg://attendance:attendance@localhost:15432/attendance'
     Set-ProcessEnvVar -Name 'ATTENDANCE_REDIS_URL' -Value 'redis://localhost:6379/0'
-    Set-ProcessEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me-min-32-chars-needed'
+    Set-ProcessEnvVar -Name 'ATTENDANCE_JWT_SECRET' -Value 'dev-only-change-me-this-is-at-least-32b'
     Set-ProcessEnvVar -Name 'ATTENDANCE_ALLOWED_ORIGINS' -Value 'http://localhost:5173,http://localhost:3000,http://localhost:8000'
 }
 
