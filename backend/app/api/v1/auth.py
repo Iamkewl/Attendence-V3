@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Annotated
 from uuid import UUID, uuid4
 
@@ -32,7 +35,62 @@ from app.domain.models import User, UserRole
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
+# ATT-032 — issue_websocket_ticket was instantiating `RedisPubSubManager()`
+# per call. Each instance's `self._redis_client = None` re-triggered a
+# lazy `_get_client()` (which IS shared via the underlying
+# `get_redis_client()` singleton, so no extra connections were opened), but
+# it was meaningless object allocation per ticket-issue and structurally
+# confusing because the WS handler in websockets.py uses a module-level
+# `_pubsub_manager`. Use a dedicated module-level singleton on the auth
+# side to match the pattern.
+_auth_pubsub_manager = RedisPubSubManager()
+
+
 PasswordStr = Annotated[str, StringConstraints(min_length=8, max_length=128)]
+
+
+# ATT-018 — login timing oracle for email enumeration.
+# The original code did `if user is None or not verify_password(...)`, which
+# short-circuits: when the user account does not exist, verify_password (the
+# expensive Argon2 step, ~50-150 ms) is skipped, so the response time differs
+# visibly from the present-user case. An attacker could enumerate valid
+# emails by measuring median response times. To remove the timing channel we
+# always run exactly one Argon2 verify per /auth/login request, using a
+# precomputed dummy hash when the lookup missed. The hash is generated once
+# (lru_cache) with a random salt so the constant itself is harmless if it
+# ever leaks; we only use it to consume CPU, never to compare.
+@lru_cache(maxsize=1)
+def _dummy_password_hash() -> str:
+    """Return a stable dummy Argon2 hash used to equalize login timing.
+
+    Generated lazily on first miss with a random salt — verifying against it
+    always returns False, which is intentional: we use it to consume the
+    Argon2 CPU cost when the user lookup misses, NOT to validate any real
+    password. See ATT-018.
+    """
+    from app.core.security import hash_password
+
+    return hash_password(secrets.token_urlsafe(32))
+
+
+def _verify_login_credentials(
+    *,
+    user: User | None,
+    submitted_password: str,
+) -> bool:
+    """Run exactly one Argon2 verify per login attempt, regardless of whether
+    the user row exists. Closes the ATT-018 timing oracle without leaking
+    which branch consumed the CPU.
+
+    Returns True only when (a) the user row exists AND (b) the hash matches.
+    Always returns False on the miss branch after running the dummy verify.
+    """
+    if user is None:
+        # Burn the same Argon2 cost as the hit branch so a wall-clock
+        # attacker can't distinguish absent-vs-present emails.
+        verify_password(submitted_password, _dummy_password_hash())
+        return False
+    return verify_password(submitted_password, user.password_hash)
 
 
 class AuthUserRead(BaseModel):
@@ -88,6 +146,33 @@ def _seconds_until(expires_at: datetime) -> int:
     return max(int((expires_at - datetime.now(tz=UTC)).total_seconds()), 1)
 
 
+_COOKIE_SAMESITE_VALUES = ("strict", "lax", "none")
+
+
+def _read_cookie_samesite() -> str:
+    """Read and validate the per-deployment cookie SameSite attribute.
+
+    ATT-046: SameSite=Strict + Secure cookies only attach to same-site
+    requests. In a deployment where the frontend and API live on
+    different registrable domains (e.g. attendance.university.com /
+    api.universityinternal.cloud), every auth request silently drops
+    the cookie and the operator sees 401s with no FE error log.
+
+    The default is `strict` (unchanged behavior). An operator with a
+    cross-site deployment can opt out via `ATTENDANCE_COOKIE_SAMESITE=lax`
+    or `=none`; `none` is only meaningful when `Secure=True` (already
+    the case in this codebase).
+    """
+    raw = os.getenv("ATTENDANCE_COOKIE_SAMESITE", "strict").strip().lower()
+    if raw not in _COOKIE_SAMESITE_VALUES:
+        raise RuntimeError(
+            "Environment variable ATTENDANCE_COOKIE_SAMESITE must be one of: "
+            + ", ".join(_COOKIE_SAMESITE_VALUES)
+            + f" (got {raw!r})."
+        )
+    return raw
+
+
 def _set_auth_cookies(
     response: Response,
     *,
@@ -105,7 +190,13 @@ def _set_auth_cookies(
     cookie_base_kwargs: dict[str, int | str | bool] = {
         "httponly": True,
         "secure": True,
-        "samesite": "strict",
+        # ATT-046: configurable via ATTENDANCE_COOKIE_SAMESITE; default
+        # `strict` preserves the prior behavior. Reading the env here (not
+        # via security.py's cached settings) is deliberate — the cookie
+        # samesite story lives in this module that owns the cookie
+        # emission, so it can change without touching the broader security
+        # settings dataclass (which would be a B19-owned change).
+        "samesite": _read_cookie_samesite(),
     }
 
     if settings.cookie_domain is not None:
@@ -191,7 +282,14 @@ async def login(
         )
     ).scalar_one_or_none()
 
-    if user is None or not verify_password(payload.password, user.password_hash):
+    # ATT-018: run one Argon2 verify per request regardless of whether the
+    # email matches a row, so the response time cannot be used to enumerate
+    # registered emails. The miss branch burns a dummy hash; the verify
+    # always returns False in that case, but the CPU cost is identical.
+    if not _verify_login_credentials(
+        user=user,
+        submitted_password=payload.password,
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -310,7 +408,7 @@ async def refresh_session(
 )
 async def issue_websocket_ticket(current_user: CurrentUser) -> WebSocketTicketResponse:
     """Create a short-lived one-time realtime ticket for the authenticated user."""
-    pubsub_manager = RedisPubSubManager()
+    pubsub_manager = _auth_pubsub_manager
     payload = json.dumps(
         {
             "user_id": str(current_user.id),

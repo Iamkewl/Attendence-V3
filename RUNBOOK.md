@@ -356,6 +356,44 @@ The demo course must already exist in the database (seed it via the admin API or
 migration fixture) and must have at least one enrolled student, otherwise
 `emit_one_synthetic_sighting()` returns 0 and logs a warning.
 
+### 6.1 Cadence / env-var changes require a beat restart (ATT-030)
+
+The Celery Beat schedule is constructed **once**, at beat-process startup, by
+the `@lru_cache`-decorated `get_celery_app()` in
+`backend/app/worker/celery_app.py`. The following env vars are snapshotted at
+that single point in time and a change to any of them mid-run will NOT update
+the already-built `beat_schedule`:
+
+- `ATTENDANCE_CELERY_ATTENDANCE_EVALUATION_INTERVAL_SECONDS` — hourly
+  aggregation cadence (default: 3600).
+- `ATTENDANCE_CELERY_ATTENDANCE_REQUIRED_SIGHTINGS_THRESHOLD` — how many
+  sightings count as attended (default: 3; this is the `kwargs` to the
+  hourly task, not the cadence — but it is read at the same init point).
+- `ATTENDANCE_DEMO_MODE` — toggles whether the demo sighting entry is
+  added to the schedule at all.
+- `ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS` — demo emit cadence
+  (default: 5).
+
+To change any of them, restart the beat process (the worker does not need a
+restart for cadence changes — only beat):
+
+```bash
+# In docker-compose.dev.yml's `beat` service:
+docker compose -f docker-compose.dev.yml restart beat
+# Or, when running beat under supervisord / systemd:
+sudo systemctl restart attendance-beat
+```
+
+To verify the new value is in effect, the beat logs print the loaded
+schedule on startup — search for `Scheduler: Sending due task` lines.
+
+> Note: this differs from `demo_emit_sighting`'s own per-task gate, which
+> reads `ATTENDANCE_DEMO_MODE` and `ATTENDANCE_TRITON_DEMO_MODE` inside the
+> task body in `backend/app/worker/tasks.py` and IS re-read on every fire.
+> So you CAN flip the demo enable/disable at runtime (the task will start
+> or stop emitting), but to change the *cadence* (how often beat enqueues
+> the task) you must restart beat.
+
 ---
 
 ## 7. Database Operations
