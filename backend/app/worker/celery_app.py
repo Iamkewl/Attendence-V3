@@ -23,15 +23,15 @@ See RUNBOOK §6 (Demo Mode) for the operator-facing wording.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import timedelta
 from functools import lru_cache
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import task_postrun, worker_process_init
 from kombu import Queue
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -243,6 +243,29 @@ def _prime_triton_readiness(**_: object) -> None:
             "Primed Triton readiness for models: %s, %s",
             yolo_model,
             lvface_model,
+        )
+
+
+@task_postrun.connect
+def _dispose_engine_after_task(**_: object) -> None:
+    """Dispose the asyncpg engine and clear its caches after every Celery task.
+
+    Why: each Celery task invokes ``asyncio.run(...)`` which mints a fresh event
+    loop. asyncpg's connection pool (and therefore the SQLAlchemy ``AsyncEngine``)
+    binds to the loop that created it. Without disposal, ``get_session_factory()``
+    returns the cached engine from task #1's loop on task #2's loop, producing
+    ``RuntimeError: Future ... attached to a different loop`` on every subsequent
+    task. Disposing and clearing the caches after each task guarantees each task
+    builds a fresh engine on its own loop.
+    """
+    from app.core.database import dispose_engine
+
+    try:
+        asyncio.run(dispose_engine())
+    except Exception:
+        LOGGER.warning(
+            "Failed to dispose asyncpg engine after task; next task will retry with a fresh engine.",
+            exc_info=True,
         )
 
 
