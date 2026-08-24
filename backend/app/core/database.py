@@ -100,11 +100,18 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def dispose_engine() -> None:
-    """Dispose pooled database connections and clear engine/session caches."""
+    """Dispose pooled database connections and clear engine/session caches.
+
+    Caches are cleared in a ``finally`` block: if ``engine.dispose()`` raises,
+    the cached factory/engine must still be dropped, otherwise the next task
+    would reuse the dead loop-bound engine this function exists to retire.
+    """
     engine = get_async_engine()
-    await engine.dispose()
-    get_session_factory.cache_clear()
-    get_async_engine.cache_clear()
+    try:
+        await engine.dispose()
+    finally:
+        get_session_factory.cache_clear()
+        get_async_engine.cache_clear()
 
 
 __all__ = ["dispose_engine", "get_async_engine", "get_async_session", "get_session_factory"]

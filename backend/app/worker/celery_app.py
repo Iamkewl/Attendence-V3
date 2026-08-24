@@ -1,16 +1,37 @@
-"""Celery application configuration for asynchronous attendance inference workloads."""
+"""Celery application configuration for asynchronous attendance inference workloads.
+
+ATT-030 (cadence/restart): The Celery Beat schedule is constructed ONCE, at
+module-import time, by the `@lru_cache`d `get_celery_app()`. The interval
+and threshold env vars below —
+
+    ATTENDANCE_CELERY_ATTENDANCE_EVALUATION_INTERVAL_SECONDS
+    ATTENDANCE_CELERY_ATTENDANCE_REQUIRED_SIGHTINGS_THRESHOLD
+    ATTENDANCE_DEMO_MODE
+    ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS
+
+— are read at startup and snapshotted into `beat_schedule`. Changing any of
+them mid-run does NOT update the schedule; the beat process must be
+restarted for the new cadence to take effect.
+
+Note this differs from `demo_emit_sighting`'s own per-task read of
+`ATTENDANCE_DEMO_MODE` / `ATTENDANCE_TRITON_DEMO_MODE` (in `tasks.py`),
+which IS re-read every fire and CAN be flipped without a restart —
+that's the gating decision, not the cadence.
+
+See RUNBOOK §6 (Demo Mode) for the operator-facing wording.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import timedelta
 from functools import lru_cache
 
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import task_postrun, worker_process_init
 from kombu import Queue
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +130,13 @@ def get_celery_app() -> Celery:
         os.getenv("ATTENDANCE_DEMO_MODE", "").strip().lower() in {"1", "true", "yes"}
     )
     demo_sighting_interval_seconds = _read_int_env(
+        # ATT-030: read ONCE at app-init via the @lru_cache on
+        # get_celery_app(); a mid-run change to this env var will NOT
+        # update beat_schedule until the beat process is restarted.
+        # See RUNBOOK §6 for the operator-facing wording. The
+        # per-task gate on ATTENDANCE_DEMO_MODE /
+        # ATTENDANCE_TRITON_DEMO_MODE (read inside the task body in
+        # tasks.py) IS re-read every fire and CAN be flipped at runtime.
         "ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS",
         5,
         min_value=1,
@@ -215,6 +243,29 @@ def _prime_triton_readiness(**_: object) -> None:
             "Primed Triton readiness for models: %s, %s",
             yolo_model,
             lvface_model,
+        )
+
+
+@task_postrun.connect
+def _dispose_engine_after_task(**_: object) -> None:
+    """Dispose the asyncpg engine and clear its caches after every Celery task.
+
+    Why: each Celery task invokes ``asyncio.run(...)`` which mints a fresh event
+    loop. asyncpg's connection pool (and therefore the SQLAlchemy ``AsyncEngine``)
+    binds to the loop that created it. Without disposal, ``get_session_factory()``
+    returns the cached engine from task #1's loop on task #2's loop, producing
+    ``RuntimeError: Future ... attached to a different loop`` on every subsequent
+    task. Disposing and clearing the caches after each task guarantees each task
+    builds a fresh engine on its own loop.
+    """
+    from app.core.database import dispose_engine
+
+    try:
+        asyncio.run(dispose_engine())
+    except Exception:
+        LOGGER.warning(
+            "Failed to dispose asyncpg engine after task; next task will retry with a fresh engine.",
+            exc_info=True,
         )
 
 

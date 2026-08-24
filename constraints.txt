@@ -22,7 +22,7 @@
 # -----------------
 # In a clean Linux / Python 3.12 venv (matching the CI runner):
 #     pip install -e ".[dev]"
-#     pip list --format=freeze --exclude attendance-v2-backend > constraints.txt
+#     pip list --format=freeze --exclude attendance-v3-backend > constraints.txt
 # then re-add this header. Bump deliberately and let CI verify the new set.
 #
 # NOTE ON PLATFORMS: constraints only cap versions of packages that are
