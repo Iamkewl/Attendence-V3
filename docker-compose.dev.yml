@@ -6,7 +6,7 @@ volumes:
 x-api-env: &api-env
   ATTENDANCE_DATABASE_URL: postgresql+asyncpg://attendance:attendance@postgres:5432/attendance
   ATTENDANCE_REDIS_URL: redis://redis:6379/0
-  ATTENDANCE_JWT_SECRET: demo-jwt-secret-replace-in-prod
+  ATTENDANCE_JWT_SECRET: demo-jwt-secret-not-for-production-use
   ATTENDANCE_ALLOWED_ORIGINS: http://localhost:5173,http://localhost:8000
   ATTENDANCE_TRITON_URL: 10.1.46.86:8001
   ATTENDANCE_TRITON_DEMO_MODE: "false"

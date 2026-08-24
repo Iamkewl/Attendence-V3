@@ -110,7 +110,7 @@ Postgres install:
 ```powershell
 $env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
 $env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
-$env:ATTENDANCE_JWT_SECRET = "dev-only-change-me-min-32-chars-needed"
+$env:ATTENDANCE_JWT_SECRET = "dev-only-change-me-this-is-at-least-32b"
 $env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:3000,http://localhost:8000"
 ```
 
@@ -288,7 +288,7 @@ The suite needs Postgres + Redis running (`docker compose -f .\docker-compose.de
 $env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
 $env:ATTENDANCE_DATABASE_URL_TEST = $env:ATTENDANCE_DATABASE_URL
 $env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
-$env:ATTENDANCE_JWT_SECRET = "test-secret-32chars-minimum-needed"
+$env:ATTENDANCE_JWT_SECRET = "test-secret-with-at-least-32-characters"
 $env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:3000"
 $env:ATTENDANCE_TRITON_URL = "fake-host:8001"   # Triton is faked in tests
 python -m pytest
