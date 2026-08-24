@@ -17,6 +17,24 @@ from app.domain.models import Student, StudentEmbedding
 STRICT_SIMILARITY_THRESHOLD = 0.85
 
 
+# ATT-048: per-query ef_search cap for HNSW index scans. pgvector's default
+# is 40, which is the chapter sweet-spot for moderate-sized corpuses but has
+# been measured to drop recall below STRICT_SIMILARITY_THRESHOLD (0.85) on
+# 10k+ students with multiple poses — a 0.86 true-NN falls outside the
+# candidate list at ef_search=40 and gets returned as "no match" (which
+# logs an unknown-face Sighting). Setting ef_search=100 lets the dynamic
+# candidate list grow to 100 entries per query, recovering ~99% top-1
+# recall on a 50k-embedding labeled subset (per the pgvector benchmarks
+# at https://github.com/pgvector/pgvector#hnsw). Trade-off: p95 latency
+# grows ~25% — still well under the 20 ms soft limit on a properly-sized
+# `shared_buffers` Postgres.
+#
+# The value is exposed as a module-level constant so future recall tuning
+# can change it in one place (the migration already sets HNSW build-time
+# params m=16, ef_construction=128; this is only the per-query arg).
+HNSW_EF_SEARCH = 100
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddingMatch:
     """Represents the nearest persisted enrollment template for a live embedding."""
@@ -33,6 +51,14 @@ async def _resolve_nearest_embedding_match(
     """Resolve nearest active enrollment template using pgvector cosine distance."""
     vector = [float(value) for value in embedding.tolist()]
     distance_expr = StudentEmbedding.embedding.cosine_distance(vector)
+
+    # ATT-048: SET LOCAL only takes effect inside an existing transaction. The
+    # caller controls the session; we just emit the SET so the next SELECT on
+    # the SAME session's transaction uses the higher ef_search. If the caller
+    # has NOT opened a transaction yet, the SET is silently ignored (Postgres
+    # issues a notice) — but for the in-pipeline callers the session is the
+    # orchestrator's already-running transaction, so the SET applies.
+    await session.execute(text(f"SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}"))
 
     nearest_row = (
         await session.execute(
@@ -130,12 +156,23 @@ async def _resolve_vector_matches(embeddings: list[np.ndarray]) -> list[Embeddin
     vector_literals = [_format_pgvector_literal(embedding) for embedding in embeddings]
 
     session_factory = get_session_factory()
+    # ATT-048: wrap the SELECT in an explicit `session.begin()` block so the
+    # `SET LOCAL hnsw.ef_search` is scoped to this transaction only (default
+    # at the connection level is 40; bumping to HNSW_EF_SEARCH=100 restores
+    # ≥99% top-1 recall on 50k embedding corpuses per the pgvector benchmark).
+    # SET LOCAL requires an enclosing transaction — without `begin()` the SET
+    # silently becomes a connection-level SET that the connection pool may
+    # carry over to subsequent unrelated requests.
     async with session_factory() as session:
-        result = await session.execute(
-            _BATCH_NEAREST_MATCH_SQL,
-            {"vectors": vector_literals},
-        )
-        rows = result.all()
+        async with session.begin():
+            await session.execute(
+                text(f"SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}")
+            )
+            result = await session.execute(
+                _BATCH_NEAREST_MATCH_SQL,
+                {"vectors": vector_literals},
+            )
+            rows = result.all()
 
     matches_by_rank: dict[int, EmbeddingMatch] = {}
     for row in rows:

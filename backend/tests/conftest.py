@@ -247,9 +247,24 @@ async def operator_user(_session_factory):
 
 
 @pytest.fixture()
-async def student_user(_session_factory):
+async def auditor_user(_session_factory):
+    """Provision an AUDITOR-role user for RBAC denial tests.
+
+    ATT-031: this fixture was historically named `student_user`, but the
+    UserRole enum (see backend/app/domain/models/_base.py:54-60) has no
+    STUDENT role — students are not self-authenticating in this codebase;
+    attendance is read-side for instructors/admins. The previous name
+    mislabeled tests as exercising 'student permission' when they were
+    actually exercising AUDITOR permission and masking gaps in role design.
+    The new name honestly reflects what the fixture provisions.
+    """
     from app.domain.models import UserRole
-    return await _insert_user(_session_factory, email="student@test.example", full_name="Student User", role=UserRole.AUDITOR)
+    return await _insert_user(
+        _session_factory,
+        email="auditor@test.example",
+        full_name="Auditor User",
+        role=UserRole.AUDITOR,
+    )
 
 
 # ---------------------------------------------------------------------------

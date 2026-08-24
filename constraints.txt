@@ -1,0 +1,111 @@
+# Pinned dependency set for CI ("lockfile").
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# pyproject.toml declares every dependency with a floating range
+# (e.g. fastapi>=0.115.0,<1.0.0) and there is no lockfile, so CI resolved the
+# newest-compatible release of ~76 packages on every single run. Combined with
+# `filterwarnings = ["error"]` in [tool.pytest.ini_options], that makes any
+# upstream release that introduces a NEW warning a hard CI failure with zero
+# change on our side.
+#
+# That is not hypothetical: starlette 1.2.0 (2026-05-28) began emitting
+# StarletteDeprecationWarning from `starlette.testclient` when httpx (rather
+# than httpx2) is installed. filterwarnings=error promoted it to an exception
+# and test_websocket_accepts_valid_ticket started failing on unchanged code.
+#
+# Installing with `-c constraints.txt` makes the resolved set deterministic, so
+# a dependency release can no longer break main on its own. Upgrades become an
+# explicit, reviewable edit to this file instead of a silent event.
+#
+# HOW TO REGENERATE
+# -----------------
+# In a clean Linux / Python 3.12 venv (matching the CI runner):
+#     pip install -e ".[dev]"
+#     pip list --format=freeze --exclude attendance-v3-backend > constraints.txt
+# then re-add this header. Bump deliberately and let CI verify the new set.
+#
+# NOTE ON PLATFORMS: constraints only cap versions of packages that are
+# actually selected for install; they never force one in. Linux-only entries
+# (uvloop) are simply inert on other platforms, so this file is safe for local
+# use on macOS/Windows as well.
+
+alembic==1.18.5
+amqp==5.3.1
+annotated-doc==0.0.4
+annotated-types==0.8.0
+anyio==4.14.2
+argon2-cffi==25.1.0
+argon2-cffi-bindings==25.1.0
+asyncpg==0.31.0
+billiard==4.2.4
+celery==5.6.3
+certifi==2026.7.22
+cffi==2.1.0
+click==8.4.2
+click-didyoumean==0.3.1
+click-plugins==1.1.1.2
+click-repl==0.3.0
+coverage==7.15.2
+cryptography==49.0.0
+dnspython==2.8.0
+email-validator==2.3.0
+fastapi==0.140.0
+greenlet==3.5.4
+grpcio==1.67.1
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.9.1
+httptools==0.8.0
+httpx==0.28.1
+httpx2==2.9.1
+idna==3.18
+iniconfig==2.3.0
+kombu==5.6.2
+librt==0.13.0
+Mako==1.3.12
+MarkupSafe==3.0.3
+ml-dtypes==0.5.4
+mypy==1.20.2
+mypy_extensions==1.1.0
+numpy==2.5.1
+packaging==26.2
+passlib==1.7.4
+pathspec==1.1.1
+pgvector==0.5.0
+pillow==11.3.0
+pluggy==1.6.0
+prompt-toolkit==3.0.52
+protobuf==6.33.6
+psycopg2-binary==2.9.12
+pycparser==3.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+pygments==2.20.0
+pyjwt==2.13.0
+pytest==8.4.2
+pytest-asyncio==0.26.0
+pytest-cov==6.3.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+python-multipart==0.0.32
+python-rapidjson==1.23
+pyyaml==6.0.3
+redis==5.3.1
+ruff==0.16.0
+six==1.17.0
+sqlalchemy==2.0.51
+starlette==1.3.1
+tritonclient==2.70.0
+truststore==0.10.4
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+tzdata==2026.3
+tzlocal==5.4.4
+urllib3==2.7.0
+uvicorn==0.51.0
+uvloop==0.22.1
+vine==5.1.0
+watchfiles==1.2.0
+wcwidth==0.8.2
+websockets==16.1.1
