@@ -79,6 +79,17 @@ Routers mounted:
 | `/operations/*` | `api/operations.py` | Internal health and admin ops |
 | `/healthz` | `main.py` (inline) | Lightweight liveness probe |
 
+> **Note (ATT-059):** the operations router is currently mounted
+> **unprefixed at the app root** in `main.py` (i.e.
+> `app.include_router(operations_router)` with no `prefix=...`), so the
+> operational routes actually live at `/health`, `/ready`, `/version` —
+> *not* under `/operations/*`. The table row above documents the
+> *design intent* (a discrete URL prefix grouping internal ops away
+> from the public API surface); a follow-up is needed in `main.py` to
+> add `prefix="/operations"` and update the README/RUNBOOK/healthcheck
+> URLs to match. Until then, treat the `/operations/*` cells above as
+> the planned layout, and use `/health`, `/ready`, `/version` directly.
+
 Application lifespan (`_lifespan`) runs `initialize_redis()` on startup and
 `close_redis()` + `dispose_engine()` on shutdown.
 
@@ -404,6 +415,56 @@ task wrapper entirely. This avoids the `asyncio.run()` inside `asyncio.run()` er
 that would occur if tests called the Celery task synchronously in eager mode inside
 an already-running event loop.
 
+### 4.5 The asyncpg `AsyncEngine` `lru_cache` and the Production Cross-Loop Hazard
+
+§4.3 documents an event-loop-binding hazard for tests: `redis.asyncio`
+clients cached on module-level singletons pin themselves to whichever
+loop first touched them, and a subsequent `TestClient` on a different
+loop raises `Future attached to a different loop`. **The same hazard
+applies in production to the asyncpg `AsyncEngine`** and bit us as
+ATT-011; this section pins the diagnosis and the canonical fix so a
+future reviewer reading §4.3 does not mistakenly conclude loop-bound
+singletons are a test-time-only concern.
+
+**The cached singleton:** `backend/app/core/database.py` defines
+
+```python
+@lru_cache(maxsize=1)
+def get_async_engine() -> AsyncEngine: ...
+```
+
+and a sibling `get_session_factory()` `lru_cache`. Both are module-level
+and bound to a single `AsyncEngine`. asyncpg's ``AsyncEngine`` binds its
+connection pool to the event loop that created it.
+
+**Why it looks safe but isn't.** Under `celery -A app.worker.celery_app
+worker --pool=prefork`, each child process has its own fresh Python
+interpreter, so the `lru_cache` is *per child*. That part is fine. The
+problem is the second half: **Celery tasks are sync wrappers that call
+`asyncio.run(helper())` per invocation**, and `asyncio.run()` mints a
+fresh event loop for every call. The first task on a child primes
+`get_async_engine()` and binds its engine to *task #1's loop*. Task #1
+exits, its loop closes — but the engine is still in `lru_cache`. Every
+subsequent task on that child awaits sessions on a cached engine whose
+loop is closed → `RuntimeError: Future attached to a different loop` (or
+a `Event loop is closed` / `Another event loop is already being awaited`
+variant, depending on asyncpg version).
+
+**The fix (canonical pattern, ATT-011):** register a Celery `task_postrun`
+signal that disposes the cached engine after each task completes, so the
+next task mints a fresh engine bound to its own fresh loop. See
+`backend/app/worker/celery_app.py` (`dispose_engine` + the
+`@task_postrun.connect` receiver) shipped in PR #71. The same pattern
+applies to any other cross-loop `lru_cache`'d async singleton added to
+the codebase in the future.
+
+**Do not** "fix" this by removing the `lru_cache`: a per-call engine
+would defeat asyncpg's connection pool, dramatically raise latency, and
+re-introduce the very cross-loop hazard under a different name (every
+call would still bind a pool to a fresh loop). The right answer is the
+`task_postrun` disposer, not caching removal.
+
+
 ---
 
 ## 5. Data Model
@@ -412,10 +473,14 @@ Core entities and key relations:
 
 - **User** — platform identity; roles: ADMIN, INSTRUCTOR, OPERATOR, AUDITOR. One-to-one with Student.
 - **Student** — academic record; linked to User via `user_id` (CASCADE delete). Holds program, enrollment year, active flag.
-- **StudentEmbedding** — 512-D pgvector embedding per student face template. Many-to-one with Student. Includes quality score, template version, and active flag. Nearest-neighbour search uses cosine distance (`<=>` operator).
+- **StudentEmbedding** — 512-D pgvector embedding per student face template. Many-to-one with Student. Includes quality score, pose label, and active flag. Nearest-neighbour search uses cosine distance (`<=>` operator).
 - **Course** — academic course entity; has `is_active` flag.
 - **Room** — physical classroom with optional capacity.
-- **Session** — planned class meeting (Course + Room + scheduled time). Not to be confused with auth sessions (which are JWT/Redis-managed).
+- **Session** — *not yet modeled.* A scheduled-class-meeting entity (Course + Room + scheduled time)
+  does not currently exist in the ORM. The closest analog today is `ClassSessionRecord` (below),
+  but that is the **output** of the daily aggregation job, not the planned-meeting entity itself.
+  The class-timetable gap is tracked as ATT-040 (Roadmap P0). Do not confuse `Session` (which
+  does not exist) with auth sessions, which are JWT/Redis-managed — see §2 (security).
 - **Sighting** — one raw AI recognition event: `student_id` (nullable, SET NULL on student delete), `course_id` (RESTRICT), `room_id` (nullable), `timestamp`, `camera_id`, `confidence_score`, `embedding_reference`. Indexed on `(course_id, timestamp)`, `(student_id, timestamp)`, `(camera_id, timestamp)`.
 - **ClassSessionRecord** — daily attendance summary per student per course, upserted by `task_evaluate_daily_attendance`.
 
