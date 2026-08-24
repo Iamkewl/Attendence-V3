@@ -13,7 +13,7 @@ from uuid import UUID
 
 import numpy as np
 from celery import states
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from PIL import Image
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -59,6 +59,15 @@ def _read_positive_int_env(name: str, default: int) -> int:
 
 _DEFAULT_MAX_FRAME_BYTES = 4 * 1024 * 1024  # 4 MiB raw tensor bytes; the issue's upper-bound example
 _MAX_FRAME_BYTES = _read_positive_int_env("ATTENDANCE_MAX_FRAME_BYTES", _DEFAULT_MAX_FRAME_BYTES)
+
+# Aggregate cap for /batch payloads. Without it the JSON endpoint admits up to
+# max_frames x 256 MiB of declared tensor data — the same worker-OOM class
+# ATT-013 describes for /stream, reachable with plain HTTP instead of an
+# upload. Enforced twice: on the declared Content-Length before parsing (so a
+# huge body is refused without buffering) and on the sum of per-frame declared
+# tensor sizes after schema validation.
+_DEFAULT_MAX_BATCH_BYTES = 64 * 1024 * 1024  # 64 MiB aggregate
+_MAX_BATCH_BYTES = _read_positive_int_env("ATTENDANCE_MAX_BATCH_BYTES", _DEFAULT_MAX_BATCH_BYTES)
 
 # Internal error messages are kept generic by default; operators can opt in
 # to surfacing str(exception) on FAILURE/REVOKED task states for debugging.
@@ -174,7 +183,26 @@ async def enqueue_stream_inference(
     priority: Annotated[bool, Form()] = False,
 ) -> InferenceTaskAccepted:
     """Accept one streamed frame and enqueue the asynchronous inference pipeline."""
-    frame_bytes = await frame_file.read()
+    # Read in bounded chunks and abort as soon as the cap is exceeded so an
+    # oversized chunked upload is rejected mid-stream instead of being fully
+    # buffered in the API process first.
+    chunks: list[bytes] = []
+    received = 0
+    while True:
+        chunk = await frame_file.read(256 * 1024)
+        if not chunk:
+            break
+        received += len(chunk)
+        if received > _MAX_FRAME_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Uploaded frame_file exceeds the maximum of {_MAX_FRAME_BYTES} bytes; "
+                    f"reduce the declared tensor shape or raise ATTENDANCE_MAX_FRAME_BYTES."
+                ),
+            )
+        chunks.append(chunk)
+    frame_bytes = b"".join(chunks)
     if not frame_bytes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -235,10 +263,47 @@ async def enqueue_stream_inference(
 )
 async def enqueue_batch_inference(
     current_user: CurrentUser,
+    request: Request,
     payload: InferenceBatchRequest,
     priority: bool = False,
 ) -> InferenceTaskAccepted:
     """Accept a validated multi-frame payload and enqueue the asynchronous inference pipeline."""
+    # Pre-parse guard: refuse oversized bodies before FastAPI buffers the JSON.
+    declared_length = request.headers.get("content-length", "")
+    if declared_length.isdigit() and int(declared_length) > _MAX_BATCH_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Batch payload exceeds the maximum of {_MAX_BATCH_BYTES} bytes; "
+                f"split the batch or raise ATTENDANCE_MAX_BATCH_BYTES."
+            ),
+        )
+
+    # Post-parse accounting: per-frame and aggregate caps computed from the
+    # declared tensor shapes (cheap arithmetic, no base64 decoding needed).
+    total_declared = 0
+    for frame in payload.frames:
+        bytes_per_value = 4 if frame.dtype == "float32" else 1
+        declared = frame.width * frame.height * frame.channels * bytes_per_value
+        if declared > _MAX_FRAME_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"Frame '{frame.frame_id}' declares {declared} bytes which exceeds the "
+                    f"per-frame maximum of {_MAX_FRAME_BYTES} bytes "
+                    f"(ATTENDANCE_MAX_FRAME_BYTES)."
+                ),
+            )
+        total_declared += declared
+    if total_declared > _MAX_BATCH_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Batch declares {total_declared} bytes across frames which exceeds the "
+                f"aggregate maximum of {_MAX_BATCH_BYTES} bytes (ATTENDANCE_MAX_BATCH_BYTES)."
+            ),
+        )
+
     accepted = _enqueue_inference_batch(payload, use_priority_queue=priority)
     await _set_task_owner(accepted.task_id, current_user.id)
     return accepted
