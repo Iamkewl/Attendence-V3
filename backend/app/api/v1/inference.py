@@ -195,7 +195,7 @@ async def enqueue_stream_inference(
         received += len(chunk)
         if received > _MAX_FRAME_BYTES:
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=(
                     f"Uploaded frame_file exceeds the maximum of {_MAX_FRAME_BYTES} bytes; "
                     f"reduce the declared tensor shape or raise ATTENDANCE_MAX_FRAME_BYTES."
@@ -214,7 +214,7 @@ async def enqueue_stream_inference(
         # would otherwise pass schema validation and force a worker OOM. Cap
         # at intake so the worker never allocates the array.
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=(
                 f"Uploaded frame_file exceeds the maximum of {_MAX_FRAME_BYTES} bytes; "
                 f"reduce the declared tensor shape or raise ATTENDANCE_MAX_FRAME_BYTES."
@@ -245,7 +245,7 @@ async def enqueue_stream_inference(
         )
     except ValidationError as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid frame tensor payload.",
         ) from exc
 
@@ -272,7 +272,7 @@ async def enqueue_batch_inference(
     declared_length = request.headers.get("content-length", "")
     if declared_length.isdigit() and int(declared_length) > _MAX_BATCH_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=(
                 f"Batch payload exceeds the maximum of {_MAX_BATCH_BYTES} bytes; "
                 f"split the batch or raise ATTENDANCE_MAX_BATCH_BYTES."
@@ -287,7 +287,7 @@ async def enqueue_batch_inference(
         declared = frame.width * frame.height * frame.channels * bytes_per_value
         if declared > _MAX_FRAME_BYTES:
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=(
                     f"Frame '{frame.frame_id}' declares {declared} bytes which exceeds the "
                     f"per-frame maximum of {_MAX_FRAME_BYTES} bytes "
@@ -297,7 +297,7 @@ async def enqueue_batch_inference(
         total_declared += declared
     if total_declared > _MAX_BATCH_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=(
                 f"Batch declares {total_declared} bytes across frames which exceeds the "
                 f"aggregate maximum of {_MAX_BATCH_BYTES} bytes (ATTENDANCE_MAX_BATCH_BYTES)."
@@ -442,7 +442,7 @@ async def recognize_photo(
 
     if len(raw_bytes) > _MAX_PHOTO_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="Image file exceeds maximum allowed size of 10 MB.",
         )
 

@@ -23,10 +23,13 @@ from httpx import AsyncClient
 
 
 def _frame(frame_id: str, *, width: int, height: int, channels: int = 3, dtype: str = "uint8") -> dict:
-    """Minimal valid ImageTensorPayload dict; declared size drives the caps."""
+    """Valid ImageTensorPayload dict whose byte size matches its declared shape."""
+    item_size = 4 if dtype == "float32" else 1
     return {
         "frame_id": frame_id,
-        "data_base64": base64.b64encode(b"\x01" * 16).decode("ascii"),
+        "data_base64": base64.b64encode(
+            b"\x01" * (width * height * channels * item_size)
+        ).decode("ascii"),
         "width": width,
         "height": height,
         "channels": channels,
@@ -82,7 +85,7 @@ async def test_stream_accepts_undersized_upload_after_cap_shrink(
         response = await async_client.post(
             "/api/v1/inference/stream",
             data={"frame_id": "f2", "width": 8, "height": 8},
-            files={"frame_file": ("frame.bin", b"\x00" * 512, "application/octet-stream")},
+            files={"frame_file": ("frame.bin", b"\x00" * 192, "application/octet-stream")},
             cookies=auth_cookie(admin_user),
         )
     assert response.status_code == 202, response.text
@@ -117,17 +120,23 @@ async def test_batch_rejects_aggregate_over_batch_cap(
     async_client: AsyncClient,
     admin_user,
     auth_cookie,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Many individually-small frames summing past _MAX_BATCH_BYTES get 413."""
-    # Default aggregate cap 64 MiB = 67_108_864. Each frame declares
-    # 2048*256*3 = 1_572_864 bytes (< the 4 MiB per-frame cap), so only the
-    # aggregate rule can refuse: 43 * 1_572_864 = 67_633_152 > 64 MiB.
-    payload = {"frames": [_frame(f"f{i}", width=2048, height=256) for i in range(43)]}
+    """A batch whose declared total exceeds _MAX_BATCH_BYTES gets 413."""
+    import app.api.v1.inference as m
+
+    monkeypatch.setattr(m, "_MAX_BATCH_BYTES", 4096)
+    # Each frame declares 18*18*3 = 972 bytes (< the 4 MiB per-frame cap).
+    # 5 * 972 = 4860 > 4096, so one of the two batch guards refuses: the
+    # pre-parse Content-Length guard when the transport declares a length,
+    # else the post-parse declared-sum accounting (chunked uploads). Either
+    # way the batch is refused under ATTENDANCE_MAX_BATCH_BYTES.
+    payload = {"frames": [_frame(f"f{i}", width=18, height=18) for i in range(5)]}
     response = await async_client.post(
         "/api/v1/inference/batch", json=payload, cookies=auth_cookie(admin_user)
     )
     assert response.status_code == 413, response.text
-    assert "aggregate maximum" in response.json()["detail"]
+    assert "ATTENDANCE_MAX_BATCH_BYTES" in response.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -135,10 +144,11 @@ async def test_batch_accepts_payload_just_under_aggregate_cap(
     async_client: AsyncClient,
     admin_user,
     auth_cookie,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Boundary control: 42 frames (~65.9 MB total) sit under the 64 MiB cap."""
+    """Boundary control: a modest batch sails under the default 64 MiB cap."""
     patcher, mock_task = _mock_celery_enqueue("batch-boundary-001")
-    frames = [_frame(f"f{i}", width=2048, height=256) for i in range(42)]
+    frames = [_frame(f"f{i}", width=18, height=18) for i in range(5)]  # 4860 B total
     with patcher as mock_fn:
         mock_fn.apply_async.return_value = mock_task
         response = await async_client.post(
