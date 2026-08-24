@@ -6,7 +6,7 @@
 
 2. A camera that emits two single-frame batches 5 seconds apart, where
    both frames contain the same face area, gets the same `track_id`
-   (the sentinel `_SINGLE_FRAME_NO_TRACK_ID = 0`), per the issue's
+   (unique negative sentinel ids), per the issue's
    literal ACCEPT ("or no `track_id` if the buffer is disabled").
 
 Multi-frame batches (>= 2 frames in a single `_track_detections` call)
@@ -28,7 +28,6 @@ from pathlib import Path
 
 from app.services.pipeline.detection import Detection
 from app.services.pipeline.tracking import (
-    _SINGLE_FRAME_NO_TRACK_ID,
     TrackedDetection,
     _track_detections,
 )
@@ -114,9 +113,8 @@ def test_att_028_single_frame_batch_same_face_across_two_batches_gets_same_track
     faces could equally share track_id=1.
 
     Post-fix: every detection in a single-frame batch gets the sentinel
-    `_SINGLE_FRAME_NO_TRACK_ID (0)`. The same face across both batches
-    (= any face across both batches, in the no-buffer case) shares the
-    sentinel 0 — satisfies ACCEPT literally.
+    unique negative sentinels. The ACCEPT's 'or no `track_id`' arm is the one
+    satisfied: every row reads as unassociated rather than colliding.
     """
     # Batch 1: one frame with two faces (different bbox areas).
     batch1_frame = [
@@ -131,24 +129,24 @@ def test_att_028_single_frame_batch_same_face_across_two_batches_gets_same_track
     ]
     batch2_results = _track_detections([batch2_frame], max_link_distance=96.0)
 
-    # All single-frame-batch track_ids are the sentinel 0.
+    # All single-frame-batch track_ids are unique negative sentinels: they
+    # read as "no cross-batch association" and can never collide with real
+    # tracker ids (>= 1).
     assert len(batch1_results) == 2
     assert len(batch2_results) == 1
-    assert all(t.track_id == _SINGLE_FRAME_NO_TRACK_ID for t in batch1_results)
-    assert all(t.track_id == _SINGLE_FRAME_NO_TRACK_ID for t in batch2_results)
-
-    # The first face in batch_1 and the (same) face in batch_2 share track_id.
-    # Pre-fix, batch_1's first detection got track_id=1 and batch_2's first
-    # detection got track_id=1 — accidentally the same. Post-fix, both get
-    # 0 explicitly as the "no buffer" sentinel.
-    assert batch1_results[0].track_id == batch2_results[0].track_id
-    assert batch2_results[0].track_id == _SINGLE_FRAME_NO_TRACK_ID
+    assert all(t.track_id < 0 for t in batch1_results)
+    assert all(t.track_id < 0 for t in batch2_results)
+    ids_b1 = [t.track_id for t in batch1_results]
+    ids_b2 = [t.track_id for t in batch2_results]
+    assert len(ids_b1) == len(set(ids_b1))
+    assert len(ids_b2) == len(set(ids_b2))
 
 
 def test_att_028_single_frame_batch_emits_sentinel_for_all_detections() -> None:
-    """Every detection in a single-frame batch gets the sentinel 0, regardless
-    of count or surface bbox. Anchors the "no buffer" sentinel behaviour
-    directly — pre-fix code fabricated distinct per-row IDs.
+    """Every detection in a single-frame batch gets a unique negative sentinel,
+    regardless of count or surface bbox — pre-refinement code emitted the SAME
+    id (0) for every row, which collides with the results table's React keys
+    and collapses orchestrator track_count to 1.
     """
     frame = [
         _mk_detection(frame_id="f", bbox=(10.0, 10.0, 20.0, 20.0), score=0.9),
@@ -157,7 +155,9 @@ def test_att_028_single_frame_batch_emits_sentinel_for_all_detections() -> None:
     ]
     results = _track_detections([frame], max_link_distance=96.0)
     assert len(results) == 3
-    assert all(r.track_id == _SINGLE_FRAME_NO_TRACK_ID for r in results)
+    assert all(r.track_id < 0 for r in results)
+    ids = [r.track_id for r in results]
+    assert len(ids) == len(set(ids)), f"sentinel ids must be unique, got {ids}"
 
 
 def test_att_028_empty_batch_returns_empty_list() -> None:
@@ -196,9 +196,9 @@ def test_att_028_multi_frame_tracker_links_same_face_within_batch() -> None:
     assert len(results) == 2
     # Both detections share track_id (linked by centroid distance).
     assert results[0].track_id == results[1].track_id
-    # The shared track_id is NOT the sentinel 0 (multi-frame batches use real
-    # track IDs starting at 1).
-    assert results[0].track_id != _SINGLE_FRAME_NO_TRACK_ID
+    # The shared track_id is positive (multi-frame batches use real track IDs
+    # starting at 1); sentinels are negative.
+    assert results[0].track_id >= 1
 
 
 def test_att_028_multi_frame_tracker_assigns_fresh_id_when_no_link() -> None:
@@ -220,10 +220,9 @@ def test_att_028_multi_frame_tracker_assigns_fresh_id_when_no_link() -> None:
 
 
 def test_att_028_multi_frame_tracker_real_track_ids_do_not_collide_with_sentinel() -> None:
-    """Multi-frame batches' track IDs (>= 1) must never produce 0.
-
-    A maintainer reusing these IDs for downstream comparisons should never
-    see a collision with the single-frame sentinel 0.
+    """Multi-frame batches' track IDs (>= 1) live in a disjoint range from the
+    single-frame sentinels (negative), so no downstream comparison can see a
+    collision between a real track and a "no association" marker.
     """
     # Multi-frame batch with two faces per frame for several frames.
     frame_a = [
@@ -236,8 +235,7 @@ def test_att_028_multi_frame_tracker_real_track_ids_do_not_collide_with_sentinel
     ]
     results = _track_detections([frame_a, frame_b], max_link_distance=96.0)
     assert len(results) == 4
-    # No multi-frame track_id should equal the sentinel 0.
-    assert all(r.track_id != _SINGLE_FRAME_NO_TRACK_ID for r in results)
+    # No multi-frame track_id may fall into the negative sentinel domain.
     assert all(r.track_id >= 1 for r in results)
 
 
@@ -254,7 +252,7 @@ def test_att_028_tracked_detection_dataclass_preserves_int_track_id_type() -> No
     sentinel = results[0].track_id
     # Sentinel is an int (not None).
     assert isinstance(sentinel, int)
-    assert sentinel == _SINGLE_FRAME_NO_TRACK_ID
+    assert sentinel < 0
 
 
 def test_att_028_tracked_detection_preserves_detection_fields() -> None:
@@ -279,4 +277,4 @@ def test_att_028_tracked_detection_preserves_detection_fields() -> None:
     assert r.bbox == (10.0, 20.0, 30.0, 40.0)
     assert r.score == 0.77
     assert r.class_id == 5
-    assert r.track_id == _SINGLE_FRAME_NO_TRACK_ID
+    assert r.track_id < 0

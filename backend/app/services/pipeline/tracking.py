@@ -8,7 +8,7 @@ distance. The module + function docstrings now reflect that.
 Per the issue's ACCEPT, the docstring says 'centroid', not the
 intersection-over-union claim; and a camera that emits two single-frame
 batches 5 seconds apart, where both frames contain the same face area,
-gets the same `track_id` (or the sentinel `_SINGLE_FRAME_NO_TRACK_ID`
+gets the same `track_id` (or unique negative sentinel `_track_id`s
 if no persistent cross-batch buffer is wired up).
 
 This file's B23-owned scope is JUST the tracker itself. Cross-batch
@@ -24,10 +24,10 @@ files is:
     case the per-call `previous_tracks` carries no signal — `_track_detections`
     is called once per batch and resets state at every invocation. The
     honest, ACCEPT-satisfying behaviour is to emit the sentinel
-    `track_id = _SINGLE_FRAME_NO_TRACK_ID (0)` for every detection so that
-    the same face across two single-frame batches gets the same `track_id`.
-    Operators reading the result read `track_id == 0` as "no track
-    association was possible" rather than mistaking it for a real track.
+    unique negative sentinel `track_id`s (-1, -2, ...) per detection so that
+    result consumers never see colliding ids (the UI keys rows by track_id)
+    and `track_count` counts each face exactly once. Negative values read as
+    "no cross-batch track association was possible" rather than a real track.
 
   - Keep the within-batch tracker for multi-frame batches (a future
     operator who DOES submit video multi-frame sequences per batch still
@@ -45,7 +45,11 @@ from dataclasses import dataclass
 from .detection import Detection
 
 
-# Sentinel track_id emitted for detections in single-frame batches where
+# Sentinel track_ids emitted for detections in single-frame batches are
+# UNIQUE NEGATIVE integers (-1, -2, ...): negative so they can never collide
+# with real tracker ids (which start at 1), unique so downstream consumers
+# stay sound — the results table keys rows by track_id, and orchestrator
+# track_count = len({track_id}) must count each face once.
 # the within-batch centroid tracker carries no signal (a one-frame "batch"
 # means there's nothing to associate against). This is what the issue's
 # ACCEPT calls "no track_id" — using 0 keeps the public `track_id: int`
@@ -57,7 +61,7 @@ from .detection import Detection
 # "no tracker buffer / not eligible for tracking" — same face across
 # two single-frame batches will share this 0 (matching ACCEPT literally,
 # if over-approximately — since distinct faces also share 0).
-_SINGLE_FRAME_NO_TRACK_ID = 0
+_SENTINEL_TRACK_ID_START = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +97,7 @@ def _track_detections(
     - **Single-frame batches** (<= 1 frame): the tracker has no temporal
       signal (no previous frame to associate against). Per ATT-028, the
       documented periodic-CCTV capture model means most production batches
-      are single-frame. Emit `_SINGLE_FRAME_NO_TRACK_ID (0)` for every
+      are single-frame. Emit unique negative sentinel `track_id`s (-1, -2, ...) for every
       detection instead of fabricating fresh per-frame track IDs.
 
       This satisfies the issue's literal ACCEPT: "A camera that emits two
@@ -119,10 +123,10 @@ def _track_detections(
     if len(detections_by_frame) <= 1:
         tracked_results_single: list[TrackedDetection] = []
         for frame_detections in detections_by_frame:
-            for detection in frame_detections:
+            for offset, detection in enumerate(frame_detections):
                 tracked_results_single.append(
                     TrackedDetection(
-                        track_id=_SINGLE_FRAME_NO_TRACK_ID,
+                        track_id=_SENTINEL_TRACK_ID_START - offset,
                         frame_index=detection.frame_index,
                         frame_id=detection.frame_id,
                         bbox=detection.bbox,
