@@ -11,12 +11,15 @@ demo:
 	@bash scripts/wait_for_api.sh
 	@echo "==> Running Alembic migrations..."
 	$(COMPOSE) exec api alembic upgrade head
-	@echo "==> Seeding demo data..."
+	@echo "==> Seeding demo data (requires ATTENDANCE_DEMO_MODE=1 in api env)"
+	@echo "    If the next command errors, set ATTENDANCE_DEMO_MODE=1 in"
+	@echo "    docker-compose.dev.yml's api service env and restart with 'make demo'."
 	$(COMPOSE) exec api python /app/backend/scripts/seed_demo_data.py
 	@echo ""
 	@echo "============================================================"
 	@echo "  Open http://localhost:5173"
-	@echo "  Login: admin@demo.local / DemoAdmin1!"
+	@echo "  Login: admin@attendance.demo"
+	@echo "  Password: printed once by the seed script above (random per run)"
 	@echo "  API docs: http://localhost:8000/docs"
 	@echo "============================================================"
 
