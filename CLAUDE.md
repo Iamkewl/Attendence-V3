@@ -98,7 +98,7 @@ docker compose -f .\docker-compose.dev.yml up -d postgres redis
 $env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
 $env:ATTENDANCE_DATABASE_URL_TEST = $env:ATTENDANCE_DATABASE_URL
 $env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
-$env:ATTENDANCE_JWT_SECRET = "test-secret-32chars-minimum-needed"
+$env:ATTENDANCE_JWT_SECRET = "test-secret-with-at-least-32-characters"
 $env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:3000"
 $env:ATTENDANCE_TRITON_URL = "fake-host:8001"
 python -m pytest

@@ -354,3 +354,142 @@ async def test_no_active_template_yields_no_match(test_engine: AsyncEngine) -> N
     assert match.student_id is None
     assert match.embedding_id is None
     assert match.cosine_similarity is None
+
+
+# ---------------------------------------------------------------------------
+# ATT-048 — per-query HNSW ef_search is set on both code paths.
+#
+# pgvector's default `hnsw.ef_search = 40` has been measured to drop recall
+# below STRICT_SIMILARITY_THRESHOLD (0.85) on 10k+ students with multiple
+# poses, returning a 0.86 true-NN as "no match" — surfacing as an unknown-
+# face Sighting. The fix in `matching.py` is to emit
+# `SET LOCAL hnsw.ef_search = HNSW_EF_SEARCH (100)` inside the matching
+# transaction before the SELECT. We can't measure recall in this
+# environment (no 50k-embedding labeled subset), so we test that:
+#   1. The module exposes a HNSW_EF_SEARCH constant that's higher than the
+#      pgvector default (40).
+#   2. The matching.py source emits `SET LOCAL hnsw.ef_search` on BOTH
+#      code paths (batch path and ORM path). Source-scan is proxy-immune
+#      to whatever Celery/SQLAlchemy settings are emitted at module load.
+#   3. The render of `SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}` (f-string
+#      interpolation with a constant integer) doesn't have a SQLi surface —
+#      the value is a module-level literal int, not a user-controlled
+#      string.
+# ---------------------------------------------------------------------------
+
+
+def test_att_048_hnsw_ef_search_constant_is_stricter_than_pgvector_default() -> None:
+    """ATT-048: HNSW_EF_SEARCH must be greater than pgvector's default of 40.
+
+    The whole point of FIX (b) is to crank the per-query candidate list wider
+    than the default to recover recall on 50k+ embedding corpuses; if a
+    future maintainer drops this back to <=40, ATT-048 recurs under load.
+    """
+    from app.services.pipeline.matching import HNSW_EF_SEARCH
+
+    assert isinstance(HNSW_EF_SEARCH, int), (
+        "ATT-048: HNSW_EF_SEARCH must be an int (the constant is interpolated "
+        "into a `SET LOCAL` string; a non-int would either be caught at string-"
+        "format time or introduce a SQLi surface)."
+    )
+    assert HNSW_EF_SEARCH > 40, (
+        f"ATT-048: HNSW_EF_SEARCH={HNSW_EF_SEARCH} is not stricter than "
+        f"pgvector's default 40; this re-introduces the recall gap on large "
+        f"embedding corpuses."
+    )
+
+
+def test_att_048_set_local_emitted_in_batch_path() -> None:
+    """Source scan: the batch (`_resolve_vector_matches`) code path emits
+    `SET LOCAL hnsw.ef_search` before the SELECT.
+
+    Pre-fix `_BATCH_NEAREST_MATCH_SQL` had no SET LOCAL; ef_search was the
+    pgvector default 40 (table-level or session-level). Post-fix the batch
+    path opens an explicit `async with session.begin():` block and emits
+    `SET LOCAL hnsw.ef_search = 100` before the SELECT — pinning the
+    per-query candidate list for the duration of the matching transaction
+    only.
+    """
+    import inspect
+    import textwrap
+
+    from app.services.pipeline import matching as matching_module
+
+    src = textwrap.dedent(inspect.getsource(matching_module._resolve_vector_matches))
+    assert "SET LOCAL hnsw.ef_search" in src, (
+        "ATT-048: _resolve_vector_matches must emit `SET LOCAL hnsw.ef_search` "
+        "before the SELECT, otherwise pgvector uses its default ef_search=40 "
+        "and recall drops below STRICT_SIMILARITY_THRESHOLD (0.85) on 50k+ "
+        "embedding corpuses."
+    )
+    # The SET LOCAL needs an enclosing transaction, so the batch path must
+    # explicitly open one (AsyncSession doesn't auto-BEGIN for raw SET
+    # without a session.begin()).
+    assert "session.begin()" in src, (
+        "ATT-048: _resolve_vector_matches must wrap the SELECT in an explicit "
+        "`async with session.begin():` block so `SET LOCAL hnsw.ef_search` "
+        "applies to this transaction only. Without it the SET may either be "
+        "ignored (if no transaction is open yet) or leak to subsequent "
+        "unrelated sessions on the pool."
+    )
+
+
+def test_att_048_set_local_emitted_in_orm_path() -> None:
+    """Source scan: the ORM (`_resolve_nearest_embedding_match`) code path
+    emits `SET LOCAL hnsw.ef_search` before the SELECT.
+
+    The ORM path is called from the orchestrator with the orchestrator's
+    already-open session; the SET LOCAL applies to that session's
+    transaction context (the orchestrator owns the BEGIN/COMMIT).
+    """
+    import inspect
+    import textwrap
+
+    from app.services.pipeline import matching as matching_module
+
+    src = textwrap.dedent(
+        inspect.getsource(matching_module._resolve_nearest_embedding_match)
+    )
+    assert "SET LOCAL hnsw.ef_search" in src, (
+        "ATT-048: _resolve_nearest_embedding_match must emit `SET LOCAL "
+        "hnsw.ef_search` before the SELECT on the same session — the "
+        "production orchestrator passes its own already-running session, "
+        "so the SET applies to the orchestrator's open transaction."
+    )
+
+
+@pytest.mark.asyncio
+async def test_att_048_batch_match_query_runs_without_error_under_set_local(
+    test_engine: AsyncEngine,
+) -> None:
+    """Smoke anchor: the batch path SQL (with the new SET LOCAL) executes
+    without error against the existing pgvector index. The migration
+    `20260519_0004_pgvector_hnsw_index.py` already defines the HNSW index
+    with `WITH (m=16, ef_construction=128)`, so `SET LOCAL hnsw.ef_search
+    = 100` is a valid per-query override against that index.
+
+    Pre-fix this test passed because the SQL was a simpler SELECT. Post-fix
+    the SQL is "SET LOCAL + SELECT" inside `session.begin()`; if any
+    SET LOCAL syntax is malformed or the index isn't HNSW-compatible, this
+    smoke test surfaces the failure on the same path the production code
+    runs.
+    """
+    from app.services.pipeline.matching import _resolve_vector_matches
+
+    reference = _unit_norm_vector(seed=REFERENCE_SEED)
+    student_id, _ = await _seed_student_with_template(
+        test_engine, reference, label="att048"
+    )
+
+    probe = vector_at_cosine(reference, 1.0)
+    # This call exercises the SET LOCAL emission path. Pre-fix the SQL
+    # did not include SET LOCAL; post-fix it does. The assertion is
+    # deliberately the same as test_batch_path_applies_threshold — the
+    # smoke value here is "the new SQL executes without error AND produces
+    # the right answer".
+    matches = await _resolve_vector_matches([probe])
+    assert len(matches) == 1
+    assert matches[0].student_id == student_id, (
+        f"ATT-048 sanity: post-ef_search change, the matched student must "
+        f"still resolve correctly — got student_id={matches[0].student_id}"
+    )

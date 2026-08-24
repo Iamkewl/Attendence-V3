@@ -1,4 +1,4 @@
-"""FastAPI application factory and runtime middleware wiring for Attendance V2."""
+"""FastAPI application factory and runtime middleware wiring for Attendance V3."""
 
 from __future__ import annotations
 
@@ -80,12 +80,12 @@ async def _lifespan(_: FastAPI):
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application instance."""
     app = FastAPI(
-        title="Attendance V2 API",
+        title="Attendance V3 API",
         description=(
             "Secure attendance backend with cookie-based authentication, "
             "JWT rotation, and Redis token revocation."
         ),
-        version="2.0.0",
+        version="3.0.0",
         lifespan=_lifespan,
         openapi_tags=[
             {

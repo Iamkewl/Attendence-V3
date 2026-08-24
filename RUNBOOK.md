@@ -69,7 +69,7 @@ Set required environment variables. Postgres is exposed on host port **15432**
 ```powershell
 $env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
 $env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
-$env:ATTENDANCE_JWT_SECRET = "dev-only-change-me-min-32-chars-needed"
+$env:ATTENDANCE_JWT_SECRET = "dev-only-change-me-this-is-at-least-32b"
 $env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:3000,http://localhost:8000"
 ```
 
@@ -143,7 +143,7 @@ docker compose -f .\docker-compose.dev.yml up -d postgres redis
 $env:ATTENDANCE_DATABASE_URL = "postgresql+asyncpg://attendance:attendance@localhost:15432/attendance"
 $env:ATTENDANCE_DATABASE_URL_TEST = $env:ATTENDANCE_DATABASE_URL
 $env:ATTENDANCE_REDIS_URL = "redis://localhost:6379/0"
-$env:ATTENDANCE_JWT_SECRET = "test-secret-32chars-minimum-needed"
+$env:ATTENDANCE_JWT_SECRET = "test-secret-with-at-least-32-characters"
 $env:ATTENDANCE_ALLOWED_ORIGINS = "http://localhost:3000"
 $env:ATTENDANCE_TRITON_URL = "fake-host:8001"
 
@@ -214,7 +214,7 @@ token validation raises an error.
 secrets are rejected by the PyJWT/passlib stack.
 
 **Fix:** Use a secret of 32 characters or more. The test suite uses
-`"test-secret-32chars-minimum-needed"` (34 chars). The warning is suppressed in
+`"test-secret-with-at-least-32-characters"` (39 chars, ≥32-byte minimum satisfied). The warning is suppressed in
 the test config via `filterwarnings` in `pyproject.toml`, but it will appear in a
 dev server that uses a short key.
 
@@ -355,6 +355,44 @@ SELECT COUNT(*) FROM sightings WHERE camera_id = 'demo-camera-overhead-01';
 The demo course must already exist in the database (seed it via the admin API or a
 migration fixture) and must have at least one enrolled student, otherwise
 `emit_one_synthetic_sighting()` returns 0 and logs a warning.
+
+### 6.1 Cadence / env-var changes require a beat restart (ATT-030)
+
+The Celery Beat schedule is constructed **once**, at beat-process startup, by
+the `@lru_cache`-decorated `get_celery_app()` in
+`backend/app/worker/celery_app.py`. The following env vars are snapshotted at
+that single point in time and a change to any of them mid-run will NOT update
+the already-built `beat_schedule`:
+
+- `ATTENDANCE_CELERY_ATTENDANCE_EVALUATION_INTERVAL_SECONDS` — hourly
+  aggregation cadence (default: 3600).
+- `ATTENDANCE_CELERY_ATTENDANCE_REQUIRED_SIGHTINGS_THRESHOLD` — how many
+  sightings count as attended (default: 3; this is the `kwargs` to the
+  hourly task, not the cadence — but it is read at the same init point).
+- `ATTENDANCE_DEMO_MODE` — toggles whether the demo sighting entry is
+  added to the schedule at all.
+- `ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS` — demo emit cadence
+  (default: 5).
+
+To change any of them, restart the beat process (the worker does not need a
+restart for cadence changes — only beat):
+
+```bash
+# In docker-compose.dev.yml's `beat` service:
+docker compose -f docker-compose.dev.yml restart beat
+# Or, when running beat under supervisord / systemd:
+sudo systemctl restart attendance-beat
+```
+
+To verify the new value is in effect, the beat logs print the loaded
+schedule on startup — search for `Scheduler: Sending due task` lines.
+
+> Note: this differs from `demo_emit_sighting`'s own per-task gate, which
+> reads `ATTENDANCE_DEMO_MODE` and `ATTENDANCE_TRITON_DEMO_MODE` inside the
+> task body in `backend/app/worker/tasks.py` and IS re-read on every fire.
+> So you CAN flip the demo enable/disable at runtime (the task will start
+> or stop emitting), but to change the *cadence* (how often beat enqueues
+> the task) you must restart beat.
 
 ---
 
