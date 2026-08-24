@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from io import BytesIO
 from typing import Annotated
 from uuid import UUID
@@ -30,6 +31,66 @@ from app.infrastructure.triton import (
 
 router = APIRouter(prefix="/students", tags=["Students"])
 LOGGER = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ATT-029: enrollment quality gate.
+#
+# Pre-fix: the API extracted an LVFace embedding and stored it as the student's
+# active template with whatever `quality_score` LVFace returned — no server-side
+# minimum. A 0.05-quality embedding (wrong person, occluded face, motion blur)
+# could be persisted as the active template without any complaint, and every
+# subsequent recognition pass at the strict 0.85 cosine threshold would then
+# be confused by garbage.
+#
+# The fix adds an `ATTENDANCE_ENROLLMENT_MIN_QUALITY` env (default 0.5 — the
+# per-issue FIX recommendation). When `extract_enrollment_embedding`'s
+# `quality_score` falls below this threshold, the API refuses the upload with
+# 422 "Image quality too low for enrollment"; no StudentEmbedding row is
+# written, no TemplateAuditLog row is written, and no existing template is
+# rotated to inactive. The student retains whatever enrollment state they
+# had before the upload.
+#
+# The threshold is read PER-REQUEST (not module-load-cached) so tests can
+# monkeypatch the env var at runtime and so operators can adjust without
+# restarting the worker / API process.
+# ---------------------------------------------------------------------------
+
+_ENROLLMENT_MIN_QUALITY_DEFAULT = 0.5
+_ENROLLMENT_MIN_QUALITY_ENV_NAME = "ATTENDANCE_ENROLLMENT_MIN_QUALITY"
+
+
+def _resolve_enrollment_min_quality() -> float:
+    """Read + validate the enrollment-quality minimum env var per call.
+
+    Returns the configured minimum quality (default 0.5). Malformed values
+    FAIL CLOSED — the strictest acceptable quality is 1.0, so any parser
+    error or out-of-range value yields a 500 with a clear error log line,
+    avoiding the silent-acceptance of a low-quality embedding under bad
+    configuration.
+
+    Acceptable range: [0.0, 1.0]. 0.0 disables the gate (matches pre-fix
+    behavior, kept as an escape hatch for testing or operator override);
+    1.0 requires perfect quality (rarely reachable in practice).
+    """
+    raw = os.getenv(_ENROLLMENT_MIN_QUALITY_ENV_NAME)
+    if raw is None or not raw.strip():
+        return _ENROLLMENT_MIN_QUALITY_DEFAULT
+
+    try:
+        value = float(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Environment variable {_ENROLLMENT_MIN_QUALITY_ENV_NAME} must be a "
+            f"float in [0.0, 1.0]; got {raw!r}."
+        ) from exc
+
+    if not (0.0 <= value <= 1.0):
+        raise RuntimeError(
+            f"Environment variable {_ENROLLMENT_MIN_QUALITY_ENV_NAME} must be a "
+            f"float in [0.0, 1.0]; got {value!r}."
+        )
+    return value
 
 
 def _normalize_pose_label(raw_pose_label: str | None) -> str:
@@ -209,6 +270,68 @@ async def enroll_student_template(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process enrollment image.",
         ) from exc
+
+    # ATT-029: server-side enrollment quality gate. The pre-fix API stored
+    # whatever `quality_score` LVFace returned with no threshold — a 0.05
+    # embedding could become the active template and poison subsequent
+    # recognition passes. The gate reads `ATTENDANCE_ENROLLMENT_MIN_QUALITY`
+    # per-request (default 0.5) and refuses the upload with 422 when the
+    # quality falls below it. NO StudentEmbedding row, TemplateAuditLog
+    # row, or pose-rotation occurs when the gate triggers — the student's
+    # pre-existing enrollment state is preserved exactly as it was.
+    #
+    # The 422 is chosen (not 400 / 409) per the issue's literal FIX:
+    # "reject ... with 422 'Image quality too low for enrollment, please
+    # retake'". 422 UNPROCESSABLE ENTITY is the right HTTP code for a
+    # client-provided image that the server can read but cannot process
+    # to a usable embedding per the server's own quality policy.
+    #
+    # Fail-closed: a bad ATTENDANCE_ENROLLMENT_MIN_QUALITY configuration
+    # raises a RuntimeError out of _resolve_enrollment_min_quality(); we
+    # surface that as a 500 (with a LOGGER.exception line for the diagnosis)
+    # rather than silently accepting garbage embeddings under bad config.
+    try:
+        min_quality = _resolve_enrollment_min_quality()
+    except RuntimeError as exc:
+        LOGGER.exception(
+            "Enrollment quality gate refused to start for student_id=%s pose=%s.",
+            student_id,
+            normalized_pose_label,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Enrollment quality gate is misconfigured "
+                "(ATTENDANCE_ENROLLMENT_MIN_QUALITY error). "
+                "Please contact the administrator."
+            ),
+        ) from exc
+
+    if quality_score < min_quality:
+        LOGGER.info(
+            "Enrollment refused for student_id=%s pose=%s: quality_score=%.4f "
+            "below ATTENDANCE_ENROLLMENT_MIN_QUALITY=%.4f.",
+            student_id,
+            normalized_pose_label,
+            quality_score,
+            min_quality,
+        )
+        raise HTTPException(
+            # ATT-029 note: use HTTP_422_UNPROCESSABLE_CONTENT (the new
+            # starlette 1.x name) — the older HTTP_422_UNPROCESSABLE_ENTITY
+            # fires StarletteDeprecationWarning, which pyproject.toml
+            # promotes to an error via filterwarnings=["error"]. The other
+            # call sites in students.py (lines 101, 106) still use the old
+            # name because no test exercises those routes in a way that
+            # hits the constant; touching them now would broaden the diff
+            # beyond B26's owned scope.
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Image quality too low for enrollment "
+                f"(quality={quality_score:.4f}, minimum={min_quality:.4f}). "
+                f"Please retake the image and retry."
+            ),
+        )
 
     created_embedding: StudentEmbedding | None = None
     try:

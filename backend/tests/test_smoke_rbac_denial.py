@@ -17,12 +17,13 @@ OPERATOR) is defined and exported in deps.py but used by zero routes
 (tracked as ATT-076) -- it has nothing to deny-test against and is
 intentionally absent below.
 
-Fixture note: the `student_user` fixture in conftest.py actually provisions
-an AUDITOR account, not a STUDENT (tracked as ATT-031, owned by another
-workstream; not fixed here). It is used below purely as "a caller who is
-neither ADMIN nor INSTRUCTOR" -- comments call out the AUDITOR role
-explicitly wherever `student_user` is referenced, to avoid perpetuating the
-mislabel in new code.
+Fixture note: the `auditor_user` fixture in conftest.py provisions an
+AUDITOR account. It is used below purely as "a caller who is neither
+ADMIN nor INSTRUCTOR" -- comments call out the AUDITOR role explicitly
+wherever `auditor_user` is referenced, to reflect the actual role
+(ATT-031 renamed `student_user` -> `auditor_user` to remove the prior
+mislabel where a fixture named after a non-existent STUDENT role was
+really an AUDITOR).
 
 Implementation note: role fixtures are always requested directly as normal
 test parameters (never via `request.getfixturevalue()`). The latter does
@@ -188,7 +189,7 @@ async def test_admin_only_route_denies_operator(
 @pytest.mark.asyncio
 async def test_admin_only_route_denies_auditor(
     async_client: AsyncClient,
-    student_user,  # ATT-031: this fixture actually provisions an AUDITOR account.
+    auditor_user,  # ATT-031: AUDITOR fixture name reflects the actual role.
     auth_cookie,
     method: str,
     path: str,
@@ -197,7 +198,7 @@ async def test_admin_only_route_denies_auditor(
     """AUDITOR must be refused on ADMIN-only routes."""
     await _assert_status(
         async_client, method, path, kwargs, 403,
-        cookies=auth_cookie(student_user), role_label="AUDITOR",
+        cookies=auth_cookie(auditor_user), role_label="AUDITOR",
     )
 
 
@@ -227,7 +228,7 @@ async def test_instructor_plus_route_denies_operator(
 @pytest.mark.asyncio
 async def test_instructor_plus_route_denies_auditor(
     async_client: AsyncClient,
-    student_user,  # ATT-031: this fixture actually provisions an AUDITOR account.
+    auditor_user,  # ATT-031: AUDITOR fixture name reflects the actual role.
     auth_cookie,
     method: str,
     path: str,
@@ -236,7 +237,7 @@ async def test_instructor_plus_route_denies_auditor(
     """AUDITOR must be refused on CurrentInstructorUser routes."""
     await _assert_status(
         async_client, method, path, kwargs, 403,
-        cookies=auth_cookie(student_user), role_label="AUDITOR",
+        cookies=auth_cookie(auditor_user), role_label="AUDITOR",
     )
 
 
