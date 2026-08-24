@@ -529,3 +529,33 @@ def test_att_026_limiter_exists_at_module_level() -> None:
     assert hasattr(ws_module, "RealtimeConnectionLimiter"), (
         "ATT-026: RealtimeConnectionLimiter class absent — caps not enforced."
     )
+
+
+@pytest.mark.asyncio
+async def test_att_026_global_counter_carries_ttl_self_heal() -> None:
+    """ws:total must carry a TTL after acquire so missed DECRs self-heal.
+
+    Pre-fix the global counter had no expiry: any process crash between
+    accept and release permanently consumed global capacity until someone
+    ran DEL by hand.
+    """
+    import uuid
+
+    import app.api.v1.websockets as ws_module
+    from app.core.security import get_redis_client
+
+    user_id = uuid.uuid4()
+    total_key = "ws:total"
+    client = await get_redis_client()
+    await client.delete(total_key)
+
+    limiter = ws_module._realtime_limiter
+    try:
+        assert await limiter.try_acquire(user_id) is True
+        ttl = await client.ttl(total_key)
+        assert ttl is not None and ttl > 0, (
+            "ATT-026: global ws:total counter has no TTL — leaked INCRs "
+            "permanently consume capacity (no self-heal window)."
+        )
+    finally:
+        await limiter.release(user_id)

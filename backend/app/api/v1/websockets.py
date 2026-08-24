@@ -144,6 +144,11 @@ class RealtimeConnectionLimiter:
                 await client.decr(_WS_TOTAL_KEY)
                 await client.decr(per_user_key)
                 return False
+            # Same TTL safety net as the per-user key: without it a missed
+            # DECR (process crash between accept and release) permanently
+            # consumes global capacity and only a manual DEL restores it.
+            # Refreshed on every successful acquire, mirroring per-user.
+            await client.expire(_WS_TOTAL_KEY, ttl_seconds)
             return True
 
     async def release(self, user_id: UUID) -> None:
