@@ -3,9 +3,9 @@ requires = ["setuptools>=70.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "attendance-v2-backend"
+name = "attendance-v3-backend"
 version = "0.1.0"
-description = "Phase 2 security-hardened backend shell for the V2 Attendance System"
+description = "Phase 3 security-hardened backend for the Attendance V3 system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -34,8 +34,17 @@ dev = [
     "pytest-cov>=6.1.1,<7.0.0",
     "ruff>=0.11.10,<1.0.0",
     "mypy>=1.15.0,<2.0.0",
-    "psycopg2-binary>=2.9.9,<3.0.0",
     "httpx>=0.27.0,<1.0.0",
+    # starlette >= 1.2.0 deprecated using httpx with starlette.testclient and
+    # asks for httpx2 instead. Because filterwarnings below promotes warnings to
+    # errors, having only httpx installed makes `from starlette.testclient
+    # import TestClient` raise. httpx2 is what TestClient prefers; httpx stays
+    # for conftest's AsyncClient/ASGITransport fixtures, which still use it.
+    "httpx2>=2.9.1,<3.0.0",
+    # Kept: scripts/verify_migration_schema_state.py (CI migration round-trip
+    # job) calls psycopg2.connect() directly, so this stays a dev dep despite
+    # the app itself being asyncpg-only (ATT-008 closed as wontfix).
+    "psycopg2-binary>=2.9.9,<3.0.0",
 ]
 
 [tool.setuptools]
@@ -63,4 +72,63 @@ filterwarnings = [
     "ignore:coroutine .* was never awaited:RuntimeWarning",
     "ignore::jwt.warnings.InsecureKeyLengthWarning",
     "ignore:Setting per-request cookies:DeprecationWarning:httpx",
+]
+
+# ──────────────────────────────────────────────────────────────────────────
+# Project-level lint / type-check / SAST config. ATT-057.
+#
+# ATT-057's "centralise config" recommendation is satisfied here. CI still
+# invokes `ruff check --select=F` directly in .github/workflows/ci.yml (which
+# overrides this section's lint.select); removing the CLI flag there lives
+# in the forbidden .github/workflows/ directory and is flagged in NOTES
+# for a human to land separately. Until then `ruff check` (no flags) uses
+# this config — reproducible locally — and CI uses --select=F which
+# matches lint.select here, so running config is reproducible.
+# ──────────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 99
+target-version = "py312"
+extend-exclude = ["backend/alembic/versions"]
+
+[tool.ruff.lint]
+# Match what CI does today (`--select=F`): Pyflakes only. The team can opt
+# into ["F", "I", "B", "UP"] in a follow-up PR after the resulting new
+# failures are triaged.
+select = ["F"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports in `__init__.py` modules are deliberate backward-compat surface;
+# F401 is false-positive on them.
+"backend/app/domain/models/__init__.py" = ["F401"]
+"backend/app/domain/schemas/__init__.py" = ["F401"]
+"backend/app/api/v1/__init__.py" = ["F401"]
+"backend/app/worker/__init__.py" = ["F401"]
+"backend/app/services/pipeline/__init__.py" = ["F401"]
+"backend/app/services/pipeline_service.py" = ["F401"]
+"backend/app/infrastructure/triton/__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+# Minimal, non-strict: this exposes a project config but does NOT surface
+# dozens of pre-existing typing errors on the first run. Strict mode per
+# `backend/app` and `backend/tests` (ATT-057's stated target) is a follow-up
+# PR once the codebase is brought under zero-error.
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = false
+exclude = [
+    "^backend/alembic/",
+    "^backend/app/infrastructure/triton/client\\.py$",
+]
+
+[[tool.mypy.overrides]]
+module = "tritonclient.*"
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = [
+    "backend/tests",
+    "backend/alembic",
 ]

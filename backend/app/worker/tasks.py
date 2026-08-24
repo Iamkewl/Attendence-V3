@@ -209,7 +209,36 @@ async def _log_pipeline_sightings(
             student_id = _parse_uuid(item.get("student_id"))
 
             timestamp = _parse_datetime(item.get("captured_at")) or generated_at
-            confidence_score = _parse_optional_float(item.get("detection_score"))
+            # ATT-017: pre-fix unconditionally stored the YOLO detection
+            # box score, so the realtime dashboard advertised "Confidence: 87%"
+            # for an unmatched face with a detectable box. Operators reading
+            # this as "recognition certainty" were misled on audit. Post-fix
+            # we prefer the pipeline's cosine_similarity (recognition match
+            # strength, in [0, 1] when matched because STRICT_SIMILARITY_
+            # THRESHOLD = 0.85) when the pipeline reports a matched student;
+            # only when no student matched do we fall through to the
+            # detection_score so the dashboard still surfaces a confidence
+            # field for unknown-face detection. `is_match` is set by the
+            # orchestrator to `student_id is not None` and is the canonical
+            # match flag (it's also True for the threshold-pass case, which
+            # is when cosine_similarity is set and >= 0.85).
+            if item.get("is_match"):
+                recognition_confidence = _parse_optional_float(
+                    item.get("cosine_similarity")
+                )
+                if recognition_confidence is not None:
+                    confidence_score = recognition_confidence
+                else:
+                    # Defensive: is_match=True but cosine_similarity missing
+                    # from the result — fall back to detection_score so the
+                    # dashboard still has a number. The orchestrator contract
+                    # guarantees cosine_similarity is set when is_match, so
+                    # this branch is belt-and-braces only.
+                    confidence_score = _parse_optional_float(
+                        item.get("detection_score")
+                    )
+            else:
+                confidence_score = _parse_optional_float(item.get("detection_score"))
             embedding_reference = str(item["identity"]) if item.get("identity") is not None else None
 
             try:

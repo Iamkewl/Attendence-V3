@@ -47,7 +47,7 @@ Four subpackages were introduced in the Phase A refactor:
 - `app.services.pipeline` — the inference pipeline broken into focused modules: `settings`, `frame`, `detection`, `tracking`, `liveness`, `embedding`, `matching`, and `orchestrator`. The entry point for callers is the facade below.
 - `app.domain.models` — SQLAlchemy ORM model classes split into one file per entity (user, student, course, room, session, sighting, governance); `__init__.py` re-exports all public symbols so existing `from app.domain.models import X` imports continue to work.
 - `app.domain.schemas` — Pydantic request/response schemas split by domain area (user, student, course, attendance, inference, common); `__init__.py` re-exports all public symbols for backward compatibility.
-- `app.infrastructure.triton` — Triton HTTP/gRPC client and its settings model, extracted from the worker layer. Import from here, not from `app.worker.triton_client`.
+- `app.infrastructure.triton` — Triton HTTP/gRPC client and its settings model, extracted from the worker layer. Import Triton client utilities from here.
 
 Facade pattern: `app.services.pipeline_service` is a thin import-forwarding module. It does not contain logic; it re-exports the public surface of `app.services.pipeline` so call sites outside the subpackage use a stable single import path.
 
@@ -294,7 +294,16 @@ $env:ATTENDANCE_TRITON_URL = "fake-host:8001"   # Triton is faked in tests
 python -m pytest
 ```
 
-Expected: `7 passed`. Triton is replaced by `FakeTritonGrpcClient` via the
+The suite grows as fixes land — don't trust a hardcoded count (earlier docs
+claimed "7 passed", then "8 passed"; both went stale). Run it and read the
+summary line. Current scope: happy-path flows plus regression tests for
+pipeline math edge cases and RBAC denials.
+
+> **Coverage scope.** These are smoke tests, **not** exhaustive coverage. They
+> do not exercise the pipeline's math edge cases in production conditions,
+> a real Celery worker (ATT-051), or the frontend (ATT-053).
+
+Triton is replaced by `FakeTritonGrpcClient` via the
 `set_triton_client_override()` test seam — no real GPU is required.
 
 ### 4) Inference Pipeline Local Validation (Optional)
@@ -316,8 +325,8 @@ Notes:
 After starting the SSH tunnel:
 
 ```powershell
-curl.exe -s http://127.0.0.1:8000/v2/health/live
-curl.exe -s http://127.0.0.1:8000/v2/health/ready
+curl.exe -s http://127.0.0.1:8000/health
+curl.exe -s http://127.0.0.1:8000/ready
 ```
 
 Expected response for both: `OK`

@@ -3,14 +3,21 @@
 Run inside the api container:
     python /app/backend/scripts/seed_demo_data.py
 
-Reads ATTENDANCE_DATABASE_URL from the environment.
+Reads ATTENDANCE_DATABASE_URL and ATTENDANCE_DEMO_MODE from the environment.
 Exits 0 on success, 1 on failure.
+
+DEMO-MODE GATE (ATT-043): refuses to seed unless ATTENDANCE_DEMO_MODE=1 is
+set in the environment, generates a fresh random admin password each run,
+and prints it to stderr once.  This guards against an accidental `make demo`
+against a reachable production database leaving a publicly-known admin
+backdoor.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import sys
 import uuid
 
@@ -27,8 +34,65 @@ DEMO_STUDENT_USER_IDS = [
 ]
 
 ADMIN_EMAIL = "admin@attendance.demo"
-ADMIN_PASSWORD = "DemoAdmin1!"
 ADMIN_FULL_NAME = "Demo Administrator"
+
+# Hard requirement: this script must not silently bootstrap an admin
+# account with a fixed password on an arbitrary environment. The demo
+# gate and per-run random password below close the
+# ATT-043 "backdoor admin" finding.
+_DEMO_MODE_ENV = "ATTENDANCE_DEMO_MODE"
+
+
+def _new_admin_password() -> str:
+    """Generate a fresh random admin password for this run.
+
+    `secrets.token_urlsafe(16)` yields ~22 chars of URL-safe base64
+    (120 bits of entropy) — well beyond any sane password policy.
+    """
+    return secrets.token_urlsafe(16)
+
+
+def _check_demo_mode_or_exit() -> None:
+    """Refuse to seed unless the operator has explicitly opted into demo mode.
+
+    Closes ATT-043: prior to this gate `make demo` could bootstrap an admin
+    account on whatever database URL happened to be reachable, with a
+    constant password published in the source tree. Now `make demo` exits 1
+    unless ``ATTENDANCE_DEMO_MODE=1`` is set in the environment.
+    """
+    mode = os.environ.get(_DEMO_MODE_ENV, "")
+    if mode != "1":
+        print(
+            "ERROR: refusing to seed demo data — "
+            f"{_DEMO_MODE_ENV}={mode!r}, expected '1'. "
+            "Set ATTENDANCE_DEMO_MODE=1 to opt into demo seeding. "
+            "Demo seeding must never run against a production database.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _warn_if_target_db_not_demo_marked(db_url: str) -> None:
+    """Best-effort warn if ATTENDANCE_DATABASE_URL doesn't look demo-targeted.
+
+    The issue's recommended fix suggests rejecting non-`_demo` URLs, but
+    doing so hard would break legitimate test setups (e.g.
+    ``attendance_test`` used by the smoke suite). We emit a warning
+    instead and let the demo_mode gate (the load-bearing control) refuse
+    runs that didn't opt in.
+    """
+    # Best-effort parse from the URL path (e.g. .../attendance_demo).
+    path = db_url.split("://", 1)[-1]
+    if "/" in path:
+        db_name = path.rsplit("/", 1)[-1]
+    else:
+        db_name = ""
+    if db_name and not (db_name.endswith("_demo") or db_name == "demo"):
+        print(
+            f"WARNING: ATTENDANCE_DATABASE_URL target '{db_name}' does not "
+            "end in _demo. Confirm this is a demo database before continuing.",
+            file=sys.stderr,
+        )
 
 
 async def seed() -> None:
@@ -39,10 +103,13 @@ async def seed() -> None:
     from app.core.security import hash_password
     from app.domain.models import User, UserRole, Course, Student
 
+    _check_demo_mode_or_exit()
+
     db_url = os.environ.get("ATTENDANCE_DATABASE_URL")
     if not db_url:
         print("ERROR: ATTENDANCE_DATABASE_URL is not set.", file=sys.stderr)
         sys.exit(1)
+    _warn_if_target_db_not_demo_marked(db_url)
 
     # Normalise to asyncpg dialect.
     if db_url.startswith("postgresql://"):
@@ -55,11 +122,16 @@ async def seed() -> None:
     created: list[str] = []
     skipped: list[str] = []
 
+    admin_password_printed = ""  # populated below for fresh-seed summary
+
     async with session_factory() as session:
         # --- Admin user ---
         existing_admin = await session.get(User, DEMO_ADMIN_ID)
         if existing_admin is None:
-            pw_hash = hash_password(ADMIN_PASSWORD)
+            # ATT-043: random per-run admin password, printed to stderr only
+            # so it lands in the operator's terminal rather than a server log.
+            admin_password = _new_admin_password()
+            pw_hash = hash_password(admin_password)
             admin = User(
                 id=DEMO_ADMIN_ID,
                 email=ADMIN_EMAIL,
@@ -70,8 +142,9 @@ async def seed() -> None:
             )
             session.add(admin)
             created.append(f"User  {ADMIN_EMAIL} (ADMIN)")
+            admin_password_printed = admin_password
         else:
-            skipped.append(f"User  {ADMIN_EMAIL} (ADMIN) — already exists")
+            skipped.append(f"User  {ADMIN_EMAIL} (ADMIN) — already exists (unchanged)")
 
         # --- Demo course ---
         existing_course = await session.get(Course, DEMO_COURSE_ID)
@@ -136,7 +209,22 @@ async def seed() -> None:
     for line in skipped:
         print(f"  SKIPPED  {line}")
     print(f"\nDone: {len(created)} created, {len(skipped)} skipped.")
-    print("\nLogin: admin@attendance.demo / DemoAdmin1!")
+    if admin_password_printed:
+        # Print the fresh admin password to stderr so server-side log
+        # aggregators that capture stdout don't accidentally persist a
+        # credential. The demo operator reads it from their terminal.
+        print(
+            f"\nFresh admin credentials (ATTN: capture now, not re-printed):\n"
+            f"  Login: {ADMIN_EMAIL}\n"
+            f"  Password: {admin_password_printed}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "\nAdmin account already existed; its password was NOT reset. "
+            "If you do not know it, drop the users table and re-seed.",
+            file=sys.stderr,
+        )
 
 
 def main() -> None:
