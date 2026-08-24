@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import uuid
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -12,12 +13,30 @@ from sqlalchemy import select
 
 from app.core.database import get_session_factory
 from app.domain.models import Student
-from app.services.attendance_service import AttendanceNotFoundError, AttendanceService, AttendanceValidationError
-
+from app.services.attendance_service import (
+    AttendanceNotFoundError,
+    AttendanceService,
+    AttendanceValidationError,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 _DEMO_CAMERA_ID = "demo-camera-overhead-01"
+
+# Fixed UUIDs of the demo-seeded students. These MUST stay in lock-step with
+# scripts/seed_demo_data.py:DEMO_STUDENT_IDS — the demo emitter is only
+# permitted to write Sighting rows for students seeded into the demo course,
+# so periodic-emit sightings cannot be attributed to non-demo students.
+# Hardcoded twice (here and in seed_demo_data.py) rather than imported because
+# `scripts/seed_demo_data.py` is not a package import target for `app.worker`
+# (it is a standalone management script guarded by `if __name__ == "__main__"`).
+_DEMO_STUDENT_IDS: tuple[UUID, ...] = (
+    uuid.UUID("00000000-0000-4000-a000-000000000010"),
+    uuid.UUID("00000000-0000-4000-a000-000000000011"),
+    uuid.UUID("00000000-0000-4000-a000-000000000012"),
+    uuid.UUID("00000000-0000-4000-a000-000000000013"),
+    uuid.UUID("00000000-0000-4000-a000-000000000014"),
+)
 
 
 def _read_demo_flags() -> tuple[bool, bool, int, UUID | None]:
@@ -59,10 +78,17 @@ async def emit_one_synthetic_sighting() -> int:
     session_factory = get_session_factory()
 
     async with session_factory() as session:
+        # Restrict the random pick to demo-seeded students only. The demo
+        # course (ATTENDANCE_DEMO_COURSE_ID) is seeded with a fixed roster
+        # (seed_demo_data.DEMO_STUDENT_IDS) and we must never write a Sighting
+        # row for a student outside that roster; otherwise the nightly
+        # task_evaluate_daily_attendance aggregation will mark non-demo
+        # students PRESENT on the demo course.
         student_rows = (
             await session.execute(
                 select(Student.id)
                 .where(Student.is_active.is_(True))
+                .where(Student.id.in_(_DEMO_STUDENT_IDS))
             )
         ).scalars().all()
 
@@ -100,4 +126,4 @@ async def emit_one_synthetic_sighting() -> int:
     return 1
 
 
-__all__ = ["emit_one_synthetic_sighting", "_read_demo_flags"]
+__all__ = ["_read_demo_flags", "emit_one_synthetic_sighting"]
