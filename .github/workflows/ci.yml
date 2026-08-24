@@ -68,11 +68,16 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            constraints.txt
 
+      # Pinned via constraints.txt for the same reason as backend-tests.yml: a
+      # floating ruff range means a new release can add rules and turn lint red
+      # with no change on our side.
       - name: Install ruff
         if: needs.changes.outputs.backend == 'true'
-        run: pip install "ruff>=0.11.10,<1.0.0"
+        run: pip install "ruff>=0.11.10,<1.0.0" -c constraints.txt
 
       - name: Ruff check (real bugs only)
         if: needs.changes.outputs.backend == 'true'

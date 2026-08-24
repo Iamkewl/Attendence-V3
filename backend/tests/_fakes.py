@@ -13,6 +13,49 @@ def _unit_norm_vector(dim: int = 512, seed: int = 42) -> np.ndarray:
     return v / np.linalg.norm(v)
 
 
+def vector_at_cosine(
+    reference: np.ndarray,
+    target_cosine: float,
+    *,
+    seed: int = 7,
+) -> np.ndarray:
+    """Build a unit vector whose cosine similarity to ``reference`` is ``target_cosine``.
+
+    Picking a different ``seed`` for ``_unit_norm_vector`` is NOT a way to get a
+    controlled similarity: two independent random unit vectors in 512 dimensions
+    are near-orthogonal (cosine ~ 0 +/- 0.04) by concentration of measure. That
+    only ever exercises "obviously different", never the neighbourhood of the
+    0.85 acceptance threshold where the interesting failures live.
+
+    So construct it explicitly. Decompose into a component along ``reference``
+    and one orthogonal to it::
+
+        v = t * r + sqrt(1 - t**2) * b_perp
+
+    where ``r`` is the unit reference and ``b_perp`` is a unit vector orthogonal
+    to ``r`` (random direction, Gram-Schmidt). Then ``v`` is unit norm and
+    ``dot(v, r) == t`` exactly, so cosine similarity is exactly ``target_cosine``.
+    """
+    if not -1.0 <= target_cosine <= 1.0:
+        raise ValueError(f"target_cosine must be in [-1, 1], got {target_cosine}")
+
+    r = np.asarray(reference, dtype=np.float64)
+    r = r / np.linalg.norm(r)
+
+    rng = np.random.default_rng(seed)
+    b = rng.standard_normal(r.shape[0])
+    # Gram-Schmidt: strip the component of b that lies along r.
+    b_perp = b - np.dot(b, r) * r
+    norm = np.linalg.norm(b_perp)
+    if norm < 1e-12:  # pragma: no cover - astronomically unlikely in 512-D
+        raise RuntimeError("Random vector was collinear with the reference.")
+    b_perp = b_perp / norm
+
+    t = float(target_cosine)
+    v = t * r + np.sqrt(max(0.0, 1.0 - t * t)) * b_perp
+    return (v / np.linalg.norm(v)).astype(np.float32)
+
+
 class FakeTritonGrpcClient:
     """Deterministic stand-in for TritonGrpcClient that never touches the network."""
 
