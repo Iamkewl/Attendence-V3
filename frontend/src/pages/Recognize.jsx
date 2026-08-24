@@ -278,6 +278,11 @@ export default function Recognize() {
       // infer the header means the request is sent with
       // `multipart/form-data; boundary=...` as required.
       const response = await client.post(RECOGNIZE_ENDPOINT, formData, {
+        // ATT-034: never send a hand-rolled multipart Content-Type (it lacks
+        // the boundary). Also strip the JSON default from the shared axios
+        // instance — with a JSON content type axios serializes FormData into
+        // `{"file":{}}` and silently drops the file.
+        headers: { 'Content-Type': undefined },
         timeout: 60000,
       })
       setResult(response.data)
