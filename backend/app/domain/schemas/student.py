@@ -63,8 +63,49 @@ class StudentRead(SchemaModel):
     graduation_year: int | None
     date_of_birth: date | None
     is_active: bool
+    biometric_consent_status: str
+    biometric_consent_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+_BIOMETRIC_CONSENT_STATUSES = ("granted", "denied", "withdrawn")
+
+
+class StudentConsentUpdate(SchemaModel):
+    """Input schema for recording one biometric consent decision (ATT-044).
+
+    'pending' is intentionally NOT settable here — it is only the initial
+    backfill state; every recorded decision is a definitive answer.
+    """
+
+    status: Annotated[str, Field(pattern="^(granted|denied|withdrawn)$")]
+    reason: Annotated[str | None, Field(max_length=2000)] = None
+
+    @model_validator(mode="after")
+    def validate_status_vocabulary(self) -> StudentConsentUpdate:
+        """Pin the exact consent vocabulary (defense in depth vs the regex)."""
+        if self.status not in _BIOMETRIC_CONSENT_STATUSES:
+            raise ValueError("status must be one of: granted, denied, withdrawn")
+        return self
+
+
+class EnrollmentCoverageRow(SchemaModel):
+    """One per-student row of the admin enrollment-coverage aggregate.
+
+    Powers the future coverage dashboard: template inventory, recency, and
+    consent state side by side. Poses are active-template pose labels only;
+    sightings_last_7d counts recognized sightings in the trailing week.
+    """
+
+    student_id: UUID
+    student_number: str
+    full_name: str
+    active_template_count: int
+    poses: list[str]
+    last_enrolled_at: datetime | None
+    biometric_consent_status: str
+    sightings_last_7d: int
 
 
 class StudentEnrollmentRead(SchemaModel):

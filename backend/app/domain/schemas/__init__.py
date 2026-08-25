@@ -10,6 +10,8 @@ from .attendance import (
     ClassSessionRecordRead,
     ClassSessionRecordUpdate,
     ClassSessionRosterRecord,
+    ClassSessionOverrideRead,
+    ClassSessionOverrideRequest,
     GovernanceLogCreate,
     GovernanceLogRead,
     SightingCreate,
@@ -41,6 +43,8 @@ from .inference import (
     RecognitionPhotoResponse,
 )
 from .student import (
+    EnrollmentCoverageRow,
+    StudentConsentUpdate,
     StudentCreate,
     StudentEnrollmentRead,
     StudentRead,
@@ -54,6 +58,8 @@ from .user import (
 
 __all__ = [
     "ClassSessionListResponse",
+    "ClassSessionOverrideRead",
+    "ClassSessionOverrideRequest",
     "ClassSessionRecordCreate",
     "ClassSessionRecordRead",
     "ClassSessionRecordUpdate",
@@ -62,6 +68,7 @@ __all__ = [
     "CourseCreate",
     "CourseRead",
     "CourseUpdate",
+    "EnrollmentCoverageRow",
     "GovernanceLogCreate",
     "GovernanceLogRead",
     "ImageTensorPayload",
@@ -80,6 +87,7 @@ __all__ = [
     "SchemaModel",
     "SightingCreate",
     "SightingRead",
+    "StudentConsentUpdate",
     "StudentCreate",
     "StudentEnrollmentRead",
     "StudentNumberStr",

@@ -13,13 +13,14 @@ from uuid import UUID
 
 import numpy as np
 from celery import states
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from PIL import Image
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentInstructorUser, CurrentUser
-from app.core.database import get_session_factory
+from app.core.database import get_async_session, get_session_factory
 from app.core.security import get_redis_client
 from app.domain.models import Student, User, UserRole
 from app.domain.schemas import (
@@ -34,6 +35,7 @@ from app.domain.schemas import (
 from app.infrastructure.triton import (
     TritonClientError,
 )
+from app.services.audit_service import AuditEvent, GovernanceAction, emit
 from app.services.pipeline_service import process_inference_batch
 from app.worker.celery_app import celery_app
 from app.worker.tasks import run_inference_pipeline
@@ -83,6 +85,17 @@ _REVEAL_INTERNAL_ERRORS = os.getenv("ATTENDANCE_REVEAL_INTERNAL_ERRORS", "").str
 # suffix; collisions are bounded by the UUID v4 space.
 _TASK_OWNER_TTL_SECONDS = _read_positive_int_env("ATTENDANCE_TASK_OWNER_TTL_SECONDS", 86_400)
 _TASK_OWNER_KEY_PREFIX = "inference_task:owner"
+
+
+def _task_read_auditing_enabled() -> bool:
+    """Return whether TASK_READ governance events should be written (D7).
+
+    Read PER CALL, never cached at import: TASK_READ auditing is OFF by
+    default because the frontend polls this endpoint and the volume is
+    unpredictable; operators opt in via ATTENDANCE_TASK_READ_AUDIT=true when
+    a data-access-report requirement materializes.
+    """
+    return os.getenv("ATTENDANCE_TASK_READ_AUDIT", "").strip().lower() in {"1", "true", "yes"}
 
 
 async def _set_task_owner(task_id: str, owner_id: UUID) -> None:
@@ -165,6 +178,7 @@ def _enqueue_inference_batch(
 )
 async def enqueue_stream_inference(
     current_user: CurrentUser,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
     frame_file: Annotated[UploadFile, File(description="Raw frame tensor bytes.")],
     frame_id: Annotated[str, Form(min_length=1, max_length=128)],
     width: Annotated[int, Form(ge=1, le=4096)],
@@ -251,6 +265,19 @@ async def enqueue_stream_inference(
 
     accepted = _enqueue_inference_batch(batch_payload, use_priority_queue=priority)
     await _set_task_owner(accepted.task_id, current_user.id)
+    # Advisory INFERENCE_ENQUEUED (D1): log-and-continue. No IP stored —
+    # routine domain events capture none (D4).
+    await emit(
+        session,
+        AuditEvent(
+            action=GovernanceAction.INFERENCE_ENQUEUED,
+            entity_type="inference_task",
+            actor_user_id=current_user.id,
+            change_summary={"frame_count": len(batch_payload.frames), "source": "stream"},
+        ),
+        strict=False,
+    )
+    await session.commit()
     return accepted
 
 
@@ -265,6 +292,7 @@ async def enqueue_batch_inference(
     current_user: CurrentUser,
     request: Request,
     payload: InferenceBatchRequest,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
     priority: bool = False,
 ) -> InferenceTaskAccepted:
     """Accept a validated multi-frame payload and enqueue the asynchronous inference pipeline."""
@@ -306,6 +334,19 @@ async def enqueue_batch_inference(
 
     accepted = _enqueue_inference_batch(payload, use_priority_queue=priority)
     await _set_task_owner(accepted.task_id, current_user.id)
+    # Advisory INFERENCE_ENQUEUED (D1): log-and-continue. No IP stored —
+    # routine domain events capture none (D4).
+    await emit(
+        session,
+        AuditEvent(
+            action=GovernanceAction.INFERENCE_ENQUEUED,
+            entity_type="inference_task",
+            actor_user_id=current_user.id,
+            change_summary={"frame_count": len(payload.frames), "source": "batch"},
+        ),
+        strict=False,
+    )
+    await session.commit()
     return accepted
 
 
@@ -318,6 +359,7 @@ async def enqueue_batch_inference(
 async def get_inference_task_status(
     current_user: CurrentUser,
     task_id: str,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> InferenceTaskStatus:
     """Return execution state for a task ID from the Celery result backend.
 
@@ -347,6 +389,22 @@ async def get_inference_task_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No inference task found for that task_id.",
         )
+
+    # TASK_READ (D7): defined in the vocabulary but OFF by default — frontend
+    # polling makes volume unpredictable. Emissions are advisory and only for
+    # AUTHORIZED reads; denials are not data-access events.
+    if _task_read_auditing_enabled():
+        await emit(
+            session,
+            AuditEvent(
+                action=GovernanceAction.TASK_READ,
+                entity_type="inference_task",
+                actor_user_id=current_user.id,
+                change_summary={"task_id": task_id},
+            ),
+            strict=False,
+        )
+        await session.commit()
 
     if state == states.SUCCESS:
         if isinstance(task_result.result, dict):
@@ -431,8 +489,9 @@ def _decode_photo_to_tensor(raw_bytes: bytes) -> Image.Image:
     ),
 )
 async def recognize_photo(
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     file: Annotated[UploadFile, File(description="JPEG or PNG image.")],
+    session: Annotated[AsyncSession, Depends(get_async_session)],
     course_id: Annotated[UUID | None, Form()] = None,
     confidence_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.25,
     liveness_threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.5,
@@ -561,6 +620,24 @@ async def recognize_photo(
         )
 
     match_count = sum(1 for d in detections if d.match is not None)
+
+    # Advisory RECOGNITION_RUN (D1): one row per synchronous recognition run
+    # with the match count only — no embedding material, no IP (D4).
+    await emit(
+        session,
+        AuditEvent(
+            action=GovernanceAction.RECOGNITION_RUN,
+            entity_type="inference_task",
+            actor_user_id=current_user.id,
+            change_summary={
+                "match_count": match_count,
+                "detection_count": len(detections),
+                "course_id": str(course_id) if course_id else None,
+            },
+        ),
+        strict=False,
+    )
+    await session.commit()
 
     return RecognitionPhotoResponse(
         image_width=width,

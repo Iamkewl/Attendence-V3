@@ -28,11 +28,11 @@ router = APIRouter(prefix="/users", tags=["Users"])
 )
 async def create_user(
     payload: UserCreate,
-    _: CurrentAdminUser,
+    current_user: CurrentAdminUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> UserRead:
     """Create one user record with hashed credentials."""
-    service = UserService(session)
+    service = UserService(session, actor=current_user)
 
     try:
         return await service.create_user(payload)
@@ -95,11 +95,11 @@ async def get_user(
 async def update_user(
     user_id: UUID,
     payload: UserUpdate,
-    _: CurrentAdminUser,
+    current_user: CurrentAdminUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> UserRead:
     """Apply partial user updates for role and profile fields."""
-    service = UserService(session)
+    service = UserService(session, actor=current_user)
 
     try:
         updated = await service.update_user(user_id, payload)
@@ -123,12 +123,12 @@ async def update_user(
 )
 async def delete_user(
     user_id: UUID,
-    _: CurrentAdminUser,
+    current_user: CurrentAdminUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> Response:
     """Delete a user and return an empty response when successful."""
-    service = UserService(session)
-    deleted = await service.delete(user_id)
+    service = UserService(session, actor=current_user)
+    deleted = await service.delete_user(user_id)
 
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")

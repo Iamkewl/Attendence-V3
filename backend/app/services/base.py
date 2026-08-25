@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Generic, TypeVar
 from uuid import UUID
@@ -12,10 +12,18 @@ from sqlalchemy import delete, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.services.audit_service import AuditEvent, AuditService
+
 
 ModelT = TypeVar("ModelT")
 CreateSchemaT = TypeVar("CreateSchemaT")
 UpdateSchemaT = TypeVar("UpdateSchemaT")
+
+# Zero-arg-result factories let subclasses defer building an AuditEvent until
+# the CRUD statement has executed inside the transaction; the factory receives
+# the operation result (inserted/updated row, deleted id, or None) so it can
+# capture server-generated primary keys.
+AuditEventFactory = Callable[[Any], AuditEvent]
 
 
 class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
@@ -24,6 +32,7 @@ class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
     def __init__(self, session: AsyncSession, model: type[ModelT]) -> None:
         self.session = session
         self.model = model
+        self._pending_audit: list[AuditEvent | AuditEventFactory] = []
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
@@ -33,6 +42,7 @@ class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
             await self.session.commit()
         except Exception:
             await self.session.rollback()
+            self._pending_audit.clear()
             raise
 
     async def get(self, entity_id: UUID) -> ModelT | None:
@@ -75,6 +85,7 @@ class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
 
         async with self.transaction():
             created = (await self.session.execute(stmt)).scalar_one()
+            await self._drain_pending_audit(created)
 
         return created
 
@@ -86,6 +97,7 @@ class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
         """Patch an existing entity and return the updated row when found."""
         values = self._normalize_payload(payload, partial=True)
         if not values:
+            self._pending_audit.clear()
             return await self.get(entity_id)
 
         stmt = (
@@ -97,6 +109,8 @@ class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
 
         async with self.transaction():
             updated = (await self.session.execute(stmt)).scalar_one_or_none()
+            if updated is not None:
+                await self._drain_pending_audit(updated)
 
         return updated
 
@@ -108,8 +122,21 @@ class AsyncCRUDService(Generic[ModelT, CreateSchemaT, UpdateSchemaT]):
 
         async with self.transaction():
             deleted_id = (await self.session.execute(stmt)).scalar_one_or_none()
+            if deleted_id is not None:
+                await self._drain_pending_audit(deleted_id)
 
         return deleted_id is not None
+
+    def queue_audit_event(self, event: AuditEvent | AuditEventFactory) -> None:
+        """Queue a governance event emitted inside the next successful write transaction."""
+        self._pending_audit.append(event)
+
+    async def _drain_pending_audit(self, result: Any = None) -> None:
+        """Emit queued governance rows via flush() inside the active transaction."""
+        while self._pending_audit:
+            entry = self._pending_audit.pop(0)
+            event = entry(result) if callable(entry) else entry
+            await AuditService(self.session).emit(event)
 
     async def _execute_read(self, statement: Any):
         """Execute a read query and rollback the session if execution fails."""

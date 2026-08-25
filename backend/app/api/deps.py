@@ -99,12 +99,72 @@ async def get_current_worker_system(current_user: CurrentUser) -> User:
     )
 
 
+async def get_current_governance_reader(current_user: CurrentUser) -> User:
+    """Require an authenticated auditor or administrator (decision D5).
+
+    AUDITOR scope is deliberately "sees-all, read-only": auditors perform none
+    of the logged actions, so a narrower scope would hand them an empty ledger.
+    Separation of duties is preserved because AUDITOR holds no write power
+    anywhere else in the API (those fail-closed denials are unchanged).
+    """
+    return _ensure_user_role(
+        current_user,
+        allowed_roles={UserRole.ADMIN, UserRole.AUDITOR},
+        detail="Auditor or administrator privileges are required for this operation.",
+    )
+
+
 CurrentAdminUser = Annotated[User, Depends(get_current_admin_user)]
 CurrentInstructorUser = Annotated[User, Depends(get_current_instructor_user)]
 CurrentWorkerSystem = Annotated[User, Depends(get_current_worker_system)]
+CurrentGovernanceReader = Annotated[User, Depends(get_current_governance_reader)]
 
 
 _COURSE_ROLE_OWNER = "owner"
+
+
+async def ensure_course_scoped_principal(
+    session: AsyncSession, user: User, *, course_id: UUID
+) -> User:
+    """Authorize ``user`` against a specific course (non-DI variant).
+
+    ATT-038: extracted from :func:`get_course_scoped_principal` so routes
+    whose path binds the course under a different name (e.g. the manual
+    override route's ``session_id``) reuse ONE implementation instead of
+    drifting. Same contract as the DI dependency: flag off = pass-through;
+    ADMIN bypasses; INSTRUCTORs need a live owner row; everyone else and
+    every missing link fails closed with an existence-denying 404 ('ta'
+    rows stored but denied in phase 1, D10).
+    """
+    settings = get_security_settings()
+    if not settings.course_scoped_authz_enabled:
+        return user
+
+    if user.role == UserRole.ADMIN:
+        return user
+
+    # Non-instructors never hold valid links; deny without touching the DB.
+    # INSTRUCTORs fall through to the link check below.
+    if user.role != UserRole.INSTRUCTOR:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course does not exist.",
+        )
+
+    linked = await session.scalar(
+        select(CourseInstructor.id)
+        .where(CourseInstructor.user_id == user.id)
+        .where(CourseInstructor.course_id == course_id)
+        .where(CourseInstructor.role_in_course == _COURSE_ROLE_OWNER)
+    )
+    if linked is None:
+        # Fail closed: 'ta'-only or unlinked instructors get the identical
+        # existence-denying 404 whether or not the course exists.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course does not exist.",
+        )
+    return user
 
 
 async def get_course_scoped_principal(
@@ -127,38 +187,11 @@ async def get_course_scoped_principal(
     The link lookup runs BEFORE any course-existence query and denials use
     404 with the same detail string the service uses for genuinely missing
     courses, so unauthorized callers learn nothing about which course ids
-    exist (no course-ID oracle). Unknown state fails closed. ``'ta'`` rows
-    are stored but DENIED in phase 1 (D10).
+    exist (no course-ID oracle). Unknown state fails closed.
     """
-    settings = get_security_settings()
-    if not settings.course_scoped_authz_enabled:
-        return current_user
-
-    if current_user.role == UserRole.ADMIN:
-        return current_user
-
-    # Non-instructors never hold valid links; deny without touching the DB.
-    # INSTRUCTORs fall through to the link check below.
-    if current_user.role != UserRole.INSTRUCTOR:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Course does not exist.",
-        )
-
-    linked = await session.scalar(
-        select(CourseInstructor.id)
-        .where(CourseInstructor.user_id == current_user.id)
-        .where(CourseInstructor.course_id == course_id)
-        .where(CourseInstructor.role_in_course == _COURSE_ROLE_OWNER)
+    return await ensure_course_scoped_principal(
+        session, current_user, course_id=course_id
     )
-    if linked is None:
-        # Fail closed: 'ta'-only or unlinked instructors get the identical
-        # existence-denying 404 whether or not the course exists.
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Course does not exist.",
-        )
-    return current_user
 
 
 CourseScopedPrincipal = Annotated[User, Depends(get_course_scoped_principal)]
@@ -167,11 +200,14 @@ CourseScopedPrincipal = Annotated[User, Depends(get_course_scoped_principal)]
 __all__ = [
     "CourseScopedPrincipal",
     "CurrentAdminUser",
+    "CurrentGovernanceReader",
     "CurrentInstructorUser",
     "CurrentUser",
     "CurrentWorkerSystem",
+    "ensure_course_scoped_principal",
     "get_course_scoped_principal",
     "get_current_admin_user",
+    "get_current_governance_reader",
     "get_current_instructor_user",
     "get_current_user",
     "get_current_worker_system",

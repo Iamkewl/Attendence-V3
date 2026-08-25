@@ -3,22 +3,36 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from io import BytesIO
 from typing import Annotated
 from uuid import UUID
 
 import numpy as np
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentAdminUser, CurrentInstructorUser
 from app.core.database import get_async_session
+from app.core.security import get_security_settings
 from app.domain.models import Student, StudentEmbedding, TemplateAuditLog
-from app.domain.schemas import StudentCreate, StudentEnrollmentRead, StudentRead, StudentUpdate
+from app.domain.schemas import (
+    StudentConsentUpdate,
+    StudentCreate,
+    StudentEnrollmentRead,
+    StudentRead,
+    StudentUpdate,
+)
 from app.services.enrollment_quality import _resolve_enrollment_min_quality
+from app.services.audit_service import (
+    AuditEvent,
+    AuditService,
+    GovernanceAction,
+    resolve_request_context,
+)
 from app.services.pipeline_service import extract_enrollment_embedding
 from app.services.student_service import StudentLinkValidationError, StudentService
 from app.infrastructure.triton import (
@@ -31,6 +45,108 @@ from app.infrastructure.triton import (
 
 router = APIRouter(prefix="/students", tags=["Students"])
 LOGGER = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ATT-044: biometric consent (MVP).
+#
+# POST /students/{id}/consent records the definitive consent decision
+# ('granted' | 'denied' | 'withdrawn') on the student row AND emits the
+# matching MANDATORY governance event (CONSENT_GRANT / CONSENT_DENIED /
+# CONSENT_WITHDRAW) through audit_service in the SAME transaction — fail-op
+# semantics: if the audit write fails, the consent update rolls back too.
+# Per decision D4 the event captures the client IP (request.client.host;
+# X-Forwarded-For is deliberately NOT trusted — design Q10) because IP is
+# the signature-evidence datum for biometric consent.
+#
+# When ATTENDANCE_ENFORCE_BIOMETRIC_CONSENT is true, enrollment endpoints
+# refuse template writes for any student whose status is not 'granted'
+# (403, fail closed). Default False keeps legacy behavior; the flag is read
+# per-request via get_security_settings() and requires a process restart to
+# flip (same posture as ATTENDANCE_COURSE_SCOPED_AUTHZ).
+# ---------------------------------------------------------------------------
+
+_CONSENT_ACTION_BY_STATUS = {
+    "granted": GovernanceAction.CONSENT_GRANT,
+    "denied": GovernanceAction.CONSENT_DENIED,
+    "withdrawn": GovernanceAction.CONSENT_WITHDRAW,
+}
+
+
+@router.post(
+    "/{student_id}/consent",
+    response_model=StudentRead,
+    summary="Record Biometric Consent",
+    description=(
+        "Record one definitive biometric consent decision for a student and "
+        "write the matching mandatory governance event (with client IP)."
+    ),
+)
+async def record_student_consent(
+    student_id: UUID,
+    payload: StudentConsentUpdate,
+    current_user: CurrentInstructorUser,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> StudentRead:
+    """Persist one consent decision plus its mandatory governance evidence."""
+    # Existence check first (404 without touching governance state).
+    if await session.get(Student, student_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Student not found.",
+        )
+
+    try:
+        # UPDATE..RETURNING yields the fully-populated post-update row
+        # (server timestamps included) without a lazy-refresh IO attempt
+        # during response serialization.
+        previous_status = (
+            await session.scalar(
+                select(Student.biometric_consent_status).where(
+                    Student.id == student_id
+                )
+            )
+        )
+        student = (
+            await session.execute(
+                update(Student)
+                .where(Student.id == student_id)
+                .values(
+                    biometric_consent_status=payload.status,
+                    biometric_consent_at=datetime.now(tz=UTC),
+                )
+                .returning(Student)
+            )
+        ).scalar_one()
+
+        # MANDATORY (D1): strict emission joins this transaction (flush-only) —
+        # a failed audit flush aborts the single commit below, so the consent
+        # update cannot land without its evidence (fail-op semantics). D4: the
+        # event captures client IP + request id; audit_service stores the IP
+        # for consent/auth events only.
+        request_id, client_ip = resolve_request_context(request)
+        await AuditService(session).emit(
+            AuditEvent(
+                action=_CONSENT_ACTION_BY_STATUS[payload.status],
+                entity_type="student",
+                entity_id=student.id,
+                actor_user_id=current_user.id,
+                reason=payload.reason,
+                change_summary={
+                    "from": previous_status,
+                    "to": payload.status,
+                    "is_minor": student.date_of_birth is not None,
+                },
+                request_id=request_id,
+                ip_address=client_ip,
+            )
+        )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    return student
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +227,11 @@ async def _decode_enrollment_image(image_file: UploadFile) -> np.ndarray:
 )
 async def create_student(
     payload: StudentCreate,
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> StudentRead:
     """Create one student profile with linked-user validation."""
-    service = StudentService(session)
+    service = StudentService(session, actor=current_user)
 
     try:
         return await service.create_student(payload)
@@ -183,7 +299,7 @@ async def get_student(
 )
 async def enroll_student_template(
     student_id: UUID,
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
     image_file: Annotated[UploadFile, File(description="Image file used for enrollment.")],
     pose_label: Annotated[str | None, Form(max_length=32)] = None,
@@ -197,6 +313,25 @@ async def enroll_student_template(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Cannot enroll templates for an inactive student.",
+        )
+
+    # ATT-044: biometric consent gate. Fail closed — only an explicitly
+    # 'granted' decision permits template writes; 'pending' (the backfill
+    # default), 'denied', and 'withdrawn' all refuse. The escape hatch is
+    # the ATTENDANCE_ENFORCE_BIOMETRIC_CONSENT flag (default False keeps
+    # legacy behavior). Consent recording itself is always available via
+    # POST /students/{id}/consent.
+    if (
+        get_security_settings().enforce_biometric_consent
+        and student.biometric_consent_status != "granted"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Biometric consent is not granted for this student. Record "
+                "consent via POST /api/v1/students/{id}/consent before "
+                "enrolling face templates."
+            ),
         )
 
     normalized_pose_label = _normalize_pose_label(pose_label)
@@ -339,6 +474,24 @@ async def enroll_student_template(
                 event_metadata={"source": "students_enroll_api_v1"},
             )
         )
+        # ATT-006: TEMPLATE_ENROLL is a mandatory governance event (D1) and
+        # joins this same transaction — flush-only, committed by the single
+        # commit below (the TemplateAuditLog same-tx pattern with a second
+        # row type). Summary carries the quality score and pose label, NEVER
+        # any vector material.
+        await AuditService(session).emit(
+            AuditEvent(
+                action=GovernanceAction.TEMPLATE_ENROLL,
+                entity_type="student_embedding",
+                entity_id=created_embedding.id,
+                actor_user_id=current_user.id,
+                change_summary={
+                    "pose_label": normalized_pose_label,
+                    "quality_score": float(quality_score),
+                    "replaced_count": len(active_pose_embeddings),
+                },
+            )
+        )
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
@@ -368,11 +521,11 @@ async def enroll_student_template(
 async def update_student(
     student_id: UUID,
     payload: StudentUpdate,
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> StudentRead:
     """Apply partial updates to an existing student profile."""
-    service = StudentService(session)
+    service = StudentService(session, actor=current_user)
 
     try:
         updated = await service.update_student(student_id, payload)
@@ -396,12 +549,12 @@ async def update_student(
 )
 async def delete_student(
     student_id: UUID,
-    _: CurrentAdminUser,
+    current_user: CurrentAdminUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> Response:
     """Delete a student profile with administrator privileges."""
-    service = StudentService(session)
-    deleted = await service.delete(student_id)
+    service = StudentService(session, actor=current_user)
+    deleted = await service.delete_student(student_id)
 
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found.")
