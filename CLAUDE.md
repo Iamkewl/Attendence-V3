@@ -104,7 +104,7 @@ $env:ATTENDANCE_TRITON_URL = "fake-host:8001"
 python -m pytest
 ```
 
-Expected: `8 passed` in roughly 5–10 seconds. If anything fails, fix it
+The suite grows as fixes land — don't hardcode a count (older docs claimed 7/8 passed; both went stale). Run it and read the summary line. If anything fails, fix it
 before opening a PR — CI is the gate, not the discovery mechanism.
 
 ---
