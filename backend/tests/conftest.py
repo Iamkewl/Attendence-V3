@@ -113,6 +113,7 @@ _DOMAIN_TABLES = [
     "template_audit_logs",
     "student_embeddings",
     "students",
+    "course_instructors",
     "courses",
     "rooms",
     "users",
