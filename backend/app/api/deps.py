@@ -180,6 +180,66 @@ async def get_course_scoped_principal(
 CourseScopedPrincipal = Annotated[User, Depends(get_course_scoped_principal)]
 
 
+_COURSE_ROLE_OWNER = "owner"
+
+
+async def get_course_scoped_principal(
+    course_id: UUID,
+    current_user: CurrentUser,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+) -> User:
+    """Authorize a principal against the specific course they are querying.
+
+    ATT-016 phase 1 (decisions D8-D10). Gated by
+    ``ATTENDANCE_COURSE_SCOPED_AUTHZ`` (default false): when off this is a
+    pure pass-through so behavior stays byte-identical to the legacy
+    ``CurrentUser``-only route.
+
+    When on, ADMIN bypasses the link check; every other role must hold a
+    live ``course_instructors`` row with ``role_in_course='owner'`` for the
+    requested course. The link is re-read from the DB on every request (no
+    memoization — caching would defeat mid-session revocation).
+
+    The link lookup runs BEFORE any course-existence query and denials use
+    404 with the same detail string the service uses for genuinely missing
+    courses, so unauthorized callers learn nothing about which course ids
+    exist (no course-ID oracle). Unknown state fails closed. ``'ta'`` rows
+    are stored but DENIED in phase 1 (D10).
+    """
+    settings = get_security_settings()
+    if not settings.course_scoped_authz_enabled:
+        return current_user
+
+    if current_user.role == UserRole.ADMIN:
+        return current_user
+
+    # Non-instructors never hold valid links; deny without touching the DB.
+    # INSTRUCTORs fall through to the link check below.
+    if current_user.role != UserRole.INSTRUCTOR:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course does not exist.",
+        )
+
+    linked = await session.scalar(
+        select(CourseInstructor.id)
+        .where(CourseInstructor.user_id == current_user.id)
+        .where(CourseInstructor.course_id == course_id)
+        .where(CourseInstructor.role_in_course == _COURSE_ROLE_OWNER)
+    )
+    if linked is None:
+        # Fail closed: 'ta'-only or unlinked instructors get the identical
+        # existence-denying 404 whether or not the course exists.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course does not exist.",
+        )
+    return current_user
+
+
+CourseScopedPrincipal = Annotated[User, Depends(get_course_scoped_principal)]
+
+
 __all__ = [
     "CourseScopedPrincipal",
     "CurrentAdminUser",

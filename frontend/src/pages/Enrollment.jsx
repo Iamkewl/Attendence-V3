@@ -19,6 +19,15 @@ function resolveErrorMessage(err) {
   if (statusCode === 400) {
     return detail || 'The image was rejected (bad format or too small to process).'
   }
+  if (statusCode === 401) {
+    return 'Your session has expired. Please sign in again.'
+  }
+  if (statusCode === 403) {
+    return 'Insufficient role: enrolling faces requires instructor or admin privileges.'
+  }
+  if (statusCode === 413) {
+    return 'Capture too large. Please retake with a smaller image (max 10 MB).'
+  }
   if (statusCode === 404) {
     return 'Student not found. Please re-select a valid student.'
   }
@@ -31,7 +40,13 @@ function resolveErrorMessage(err) {
   if (statusCode === 503) {
     return 'The face-embedding service is temporarily unavailable. Please try again in a moment.'
   }
-  return detail || err.message || 'Enrollment failed due to an unexpected error.'
+  if (statusCode) {
+    return (
+      detail ||
+      `Enrollment failed with HTTP status ${statusCode}. Please try again or contact an administrator.`
+    )
+  }
+  return err.message || 'Enrollment failed due to a network error. Check your connection and retry.'
 }
 
 // ── Spinner ────────────────────────────────────────────────────────────────
@@ -230,8 +245,12 @@ export default function Enrollment() {
     formData.append('image_file', capturedBlob, 'enrollment.jpg')
 
     try {
+      // ATT-034: never send a hand-rolled multipart Content-Type (it lacks
+      // the boundary). Also strip the JSON default from the shared axios
+      // instance — with a JSON content type axios serializes FormData into
+      // `{"image_file":{}}` and silently drops the file.
       const response = await client.post(ENROLL_ENDPOINT(selectedStudent.id), formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+        headers: { 'Content-Type': undefined },
       })
       const record = response.data
 

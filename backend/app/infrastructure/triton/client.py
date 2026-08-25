@@ -157,7 +157,7 @@ class TritonGrpcClient:
                     model_version=model_version,
                     inputs=infer_inputs,
                     outputs=requested_outputs,
-                    request_id=request_id,
+                    request_id=request_id if isinstance(request_id, str) else "",
                     client_timeout=effective_timeout,
                 )
             except InferenceServerException as exc:
@@ -217,7 +217,7 @@ class TritonGrpcClient:
             raise ValueError(f"Tensor '{name}' must not be empty.")
 
         infer_input = grpcclient.InferInput(name, contiguous_tensor.shape, "FP32")
-        infer_input.set_data_from_numpy(contiguous_tensor, binary_data=True)
+        infer_input.set_data_from_numpy(contiguous_tensor)
         return infer_input
 
     def _parse_infer_outputs(self, *, result: grpcclient.InferResult) -> dict[str, np.ndarray]:
