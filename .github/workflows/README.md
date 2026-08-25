@@ -10,7 +10,7 @@ on every pull request and every push to `main`/`master`. Target wall clock: ~75 
 1. Spins up ephemeral `pgvector/pgvector:pg16` and `redis:7-alpine` service containers.
 2. Installs the project in editable mode (`pip install -e "project/[dev]"`).
 3. Applies Alembic migrations against the ephemeral test database.
-4. Runs pytest with coverage, excluding known-untestable Triton retry internals.
+4. Runs pytest with coverage (gate: `--cov-fail-under=70`).
 5. Uploads `coverage.xml` as the `coverage-report` artifact (always, even on failure).
 
 ### Repo settings required
@@ -33,8 +33,7 @@ Export the same environment variables used by the workflow, then run:
 pip install -e "project/[dev]"
 cd project/backend && alembic upgrade head && cd ../..
 cd project && pytest -v --tb=short -m "not slow" \
-  --cov=project/backend/app --cov-report=term --cov-fail-under=70 \
-  --ignore=project/backend/app/worker/triton_client.py
+  --cov=project/backend/app --cov-report=term --cov-fail-under=70
 ```
 
 The `FakeTritonGrpcClient` fixture intercepts all calls to `ATTENDANCE_TRITON_URL`;
