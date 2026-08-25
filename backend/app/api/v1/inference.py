@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentInstructorUser, CurrentUser
+from app.api.deps import CurrentIngestUser, CurrentUser
 from app.core.database import get_async_session, get_session_factory
 from app.core.security import get_redis_client
 from app.domain.models import Student, User, UserRole
@@ -177,7 +177,7 @@ def _enqueue_inference_batch(
     ),
 )
 async def enqueue_stream_inference(
-    current_user: CurrentUser,
+    current_user: CurrentIngestUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
     frame_file: Annotated[UploadFile, File(description="Raw frame tensor bytes.")],
     frame_id: Annotated[str, Form(min_length=1, max_length=128)],
@@ -289,7 +289,7 @@ async def enqueue_stream_inference(
     description="Enqueue a batch of validated image tensor frames for asynchronous inference processing.",
 )
 async def enqueue_batch_inference(
-    current_user: CurrentUser,
+    current_user: CurrentIngestUser,
     request: Request,
     payload: InferenceBatchRequest,
     session: Annotated[AsyncSession, Depends(get_async_session)],
@@ -489,7 +489,7 @@ def _decode_photo_to_tensor(raw_bytes: bytes) -> Image.Image:
     ),
 )
 async def recognize_photo(
-    current_user: CurrentInstructorUser,
+    current_user: CurrentIngestUser,
     file: Annotated[UploadFile, File(description="JPEG or PNG image.")],
     session: Annotated[AsyncSession, Depends(get_async_session)],
     course_id: Annotated[UUID | None, Form()] = None,

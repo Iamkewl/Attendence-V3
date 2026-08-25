@@ -10,6 +10,8 @@ not fail a single existing test. This file closes that gap.
 Guards under test (backend/app/api/deps.py):
   * CurrentAdminUser      -> ADMIN only
   * CurrentInstructorUser -> ADMIN or INSTRUCTOR
+  * CurrentIngestUser     -> ADMIN or INSTRUCTOR (ATT-075: /inference/stream,
+    /inference/batch, /inference/photo)
 
 Roles (backend/app/domain/models/_base.py): ADMIN, INSTRUCTOR, AUDITOR,
 OPERATOR. There is no STUDENT role. `CurrentWorkerSystem` (ADMIN or
@@ -43,6 +45,7 @@ confirmed against this suite's actual CI run before landing this version.
 
 from __future__ import annotations
 
+import base64
 import uuid
 
 import pytest
@@ -79,6 +82,22 @@ _VALID_STUDENT_CREATE_BODY = {
 
 _FAKE_IMAGE_FILE = ("probe.png", b"not-a-real-image-the-guard-runs-first", "image/png")
 
+# Schema-valid /inference/batch body: one 2x2x3 uint8 frame (12 raw bytes) so
+# the JSON parses cleanly and a 403 can only come from the ingest guard.
+_BATCH_FRAME_B64 = base64.b64encode(b"\x00" * (2 * 2 * 3)).decode("ascii")
+_VALID_BATCH_BODY = {
+    "frames": [
+        {
+            "frame_id": "rbac-probe",
+            "data_base64": _BATCH_FRAME_B64,
+            "width": 2,
+            "height": 2,
+            "channels": 3,
+            "dtype": "uint8",
+        }
+    ]
+}
+
 
 # ---------------------------------------------------------------------------
 # Route tables: (http_method, path, extra httpx kwargs)
@@ -104,11 +123,27 @@ INSTRUCTOR_PLUS_ROUTES = [
         {"files": {"image_file": _FAKE_IMAGE_FILE}},
         id="POST:students-id-enroll",
     ),
+    # ATT-075: all three ingest endpoints are instructor-or-admin.
     pytest.param(
         "POST",
         "/api/v1/inference/photo",
         {"files": {"file": _FAKE_IMAGE_FILE}},
         id="POST:inference-photo",
+    ),
+    pytest.param(
+        "POST",
+        "/api/v1/inference/stream",
+        {
+            "files": {"frame_file": ("probe.bin", b"\x00" * 4, "application/octet-stream")},
+            "data": {"frame_id": "rbac-probe", "width": "2", "height": "2"},
+        },
+        id="POST:inference-stream",
+    ),
+    pytest.param(
+        "POST",
+        "/api/v1/inference/batch",
+        {"json": _VALID_BATCH_BODY},
+        id="POST:inference-batch",
     ),
 ]
 
