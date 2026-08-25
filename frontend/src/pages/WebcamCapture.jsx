@@ -111,7 +111,7 @@ export default function WebcamCapture({ onCapture, capturedBlob, onRetake, onSub
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
         <img
           src={capturedUrl}
-          alt="Captured enrollment photo — review before submitting"
+          alt="Captured enrollment frame — review before submitting"
           style={{
             width: '100%',
             maxWidth: 640,
