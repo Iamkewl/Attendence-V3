@@ -1,7 +1,7 @@
 """pipeline subpackage — single-responsibility modules for the inference pipeline."""
 
 from .detection import Detection
-from .matching import EmbeddingMatch, STRICT_SIMILARITY_THRESHOLD
+from .matching import EmbeddingMatch
 from .orchestrator import (
     NoFaceDetectedError,
     extract_enrollment_embedding,
@@ -15,7 +15,6 @@ __all__ = [
     "EmbeddingMatch",
     "NoFaceDetectedError",
     "PipelineSettings",
-    "STRICT_SIMILARITY_THRESHOLD",
     "TrackedDetection",
     "extract_enrollment_embedding",
     "get_pipeline_settings",
