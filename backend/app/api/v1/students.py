@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from io import BytesIO
 from typing import Annotated
 from uuid import UUID
@@ -19,6 +18,7 @@ from app.api.deps import CurrentAdminUser, CurrentInstructorUser
 from app.core.database import get_async_session
 from app.domain.models import Student, StudentEmbedding, TemplateAuditLog
 from app.domain.schemas import StudentCreate, StudentEnrollmentRead, StudentRead, StudentUpdate
+from app.services.enrollment_quality import _resolve_enrollment_min_quality
 from app.services.pipeline_service import extract_enrollment_embedding
 from app.services.student_service import StudentLinkValidationError, StudentService
 from app.infrastructure.triton import (
@@ -36,61 +36,20 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # ATT-029: enrollment quality gate.
 #
-# Pre-fix: the API extracted an LVFace embedding and stored it as the student's
-# active template with whatever `quality_score` LVFace returned — no server-side
-# minimum. A 0.05-quality embedding (wrong person, occluded face, motion blur)
-# could be persisted as the active template without any complaint, and every
-# subsequent recognition pass at the strict 0.85 cosine threshold would then
-# be confused by garbage.
+# The threshold resolver now lives in ``app.services.enrollment_quality``
+# (single source of truth, shared with the bulk enrollment importer —
+# services must not import from the api layer, and duplicating a
+# fail-closed policy invites drift). It is imported at the top of this
+# module so existing call sites and tests importing
+# ``_resolve_enrollment_min_quality`` from here keep working unchanged.
 #
-# The fix adds an `ATTENDANCE_ENROLLMENT_MIN_QUALITY` env (default 0.5 — the
-# per-issue FIX recommendation). When `extract_enrollment_embedding`'s
-# `quality_score` falls below this threshold, the API refuses the upload with
-# 422 "Image quality too low for enrollment"; no StudentEmbedding row is
-# written, no TemplateAuditLog row is written, and no existing template is
-# rotated to inactive. The student retains whatever enrollment state they
-# had before the upload.
-#
-# The threshold is read PER-REQUEST (not module-load-cached) so tests can
-# monkeypatch the env var at runtime and so operators can adjust without
-# restarting the worker / API process.
+# Behavior is unchanged: the threshold is read PER-REQUEST (not cached at
+# import), default 0.5, range [0.0, 1.0]. When `quality_score` falls
+# strictly below it, the API refuses the upload with 422 "Image quality
+# too low for enrollment"; no StudentEmbedding row is written, no
+# TemplateAuditLog row is written, and no existing template is rotated to
+# inactive. Malformed env values fail closed (RuntimeError → 500).
 # ---------------------------------------------------------------------------
-
-_ENROLLMENT_MIN_QUALITY_DEFAULT = 0.5
-_ENROLLMENT_MIN_QUALITY_ENV_NAME = "ATTENDANCE_ENROLLMENT_MIN_QUALITY"
-
-
-def _resolve_enrollment_min_quality() -> float:
-    """Read + validate the enrollment-quality minimum env var per call.
-
-    Returns the configured minimum quality (default 0.5). Malformed values
-    FAIL CLOSED — the strictest acceptable quality is 1.0, so any parser
-    error or out-of-range value yields a 500 with a clear error log line,
-    avoiding the silent-acceptance of a low-quality embedding under bad
-    configuration.
-
-    Acceptable range: [0.0, 1.0]. 0.0 disables the gate (matches pre-fix
-    behavior, kept as an escape hatch for testing or operator override);
-    1.0 requires perfect quality (rarely reachable in practice).
-    """
-    raw = os.getenv(_ENROLLMENT_MIN_QUALITY_ENV_NAME)
-    if raw is None or not raw.strip():
-        return _ENROLLMENT_MIN_QUALITY_DEFAULT
-
-    try:
-        value = float(raw.strip())
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Environment variable {_ENROLLMENT_MIN_QUALITY_ENV_NAME} must be a "
-            f"float in [0.0, 1.0]; got {raw!r}."
-        ) from exc
-
-    if not (0.0 <= value <= 1.0):
-        raise RuntimeError(
-            f"Environment variable {_ENROLLMENT_MIN_QUALITY_ENV_NAME} must be a "
-            f"float in [0.0, 1.0]; got {value!r}."
-        )
-    return value
 
 
 def _normalize_pose_label(raw_pose_label: str | None) -> str:
