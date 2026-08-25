@@ -99,9 +99,25 @@ async def get_current_worker_system(current_user: CurrentUser) -> User:
     )
 
 
+async def get_current_governance_reader(current_user: CurrentUser) -> User:
+    """Require an authenticated auditor or administrator (decision D5).
+
+    AUDITOR scope is deliberately "sees-all, read-only": auditors perform none
+    of the logged actions, so a narrower scope would hand them an empty ledger.
+    Separation of duties is preserved because AUDITOR holds no write power
+    anywhere else in the API (those fail-closed denials are unchanged).
+    """
+    return _ensure_user_role(
+        current_user,
+        allowed_roles={UserRole.ADMIN, UserRole.AUDITOR},
+        detail="Auditor or administrator privileges are required for this operation.",
+    )
+
+
 CurrentAdminUser = Annotated[User, Depends(get_current_admin_user)]
 CurrentInstructorUser = Annotated[User, Depends(get_current_instructor_user)]
 CurrentWorkerSystem = Annotated[User, Depends(get_current_worker_system)]
+CurrentGovernanceReader = Annotated[User, Depends(get_current_governance_reader)]
 
 
 _COURSE_ROLE_OWNER = "owner"
@@ -167,11 +183,13 @@ CourseScopedPrincipal = Annotated[User, Depends(get_course_scoped_principal)]
 __all__ = [
     "CourseScopedPrincipal",
     "CurrentAdminUser",
+    "CurrentGovernanceReader",
     "CurrentInstructorUser",
     "CurrentUser",
     "CurrentWorkerSystem",
     "get_course_scoped_principal",
     "get_current_admin_user",
+    "get_current_governance_reader",
     "get_current_instructor_user",
     "get_current_user",
     "get_current_worker_system",

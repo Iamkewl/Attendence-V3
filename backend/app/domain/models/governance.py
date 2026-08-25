@@ -18,7 +18,14 @@ if TYPE_CHECKING:
 
 
 class GovernanceLog(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Captures auditable governance actions across attendance domain entities."""
+    """Captures auditable governance actions across attendance domain entities.
+
+    Append-only by database trigger (migration 20260824_0007): UPDATE and
+    DELETE raise; the only sanctioned deletion path is the ops-only SECURITY
+    DEFINER ``purge_governance_before(cutoff)``. The vocabulary CHECK below
+    mirrors that migration's ``governance_action_domain`` constraint so ORM
+    metadata and DB stay in sync (autogenerate stays empty).
+    """
 
     __tablename__ = "governance_logs"
     __table_args__ = (
@@ -27,11 +34,26 @@ class GovernanceLog(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "char_length(btrim(entity_type)) > 0",
             name="governance_entity_type_not_blank",
         ),
+        CheckConstraint(
+            "action IN ("
+            "'USER_CREATE','USER_UPDATE','USER_DELETE',"
+            "'STUDENT_CREATE','STUDENT_UPDATE','STUDENT_DELETE',"
+            "'TEMPLATE_ENROLL','ATTENDANCE_EVALUATE','REFRESH_REUSED',"
+            "'LOGIN_SUCCEEDED','LOGOUT',"
+            "'INFERENCE_ENQUEUED','TASK_READ','RECOGNITION_RUN',"
+            "'GOVERNANCE_PURGE')",
+            name="governance_action_domain",
+        ),
         Index("ix_governance_actor_created_at", "actor_user_id", "created_at"),
         Index("ix_governance_entity_lookup", "entity_type", "entity_id"),
         Index("ix_governance_class_session_record_id", "class_session_record_id"),
         Index("ix_governance_request_id", "request_id"),
         Index("ix_governance_created_at", "created_at"),
+        Index(
+            "ix_governance_action_created_at",
+            "action",
+            text("created_at DESC"),
+        ),
     )
 
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(

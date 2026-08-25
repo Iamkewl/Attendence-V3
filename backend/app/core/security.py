@@ -94,6 +94,11 @@ class SecuritySettings:
     # attendance roster route. Default False keeps legacy behavior; flipping it
     # requires a process restart because SecuritySettings is cached (lru_cache).
     course_scoped_authz_enabled: bool = False
+    # ATT-006 (decision D2/D3): governance_logs retention horizon in days.
+    # Must exceed the biometric template retention horizon (ATT-045). The
+    # scheduled purge caller is deferred; the ops path today is the SECURITY
+    # DEFINER purge_governance_before(cutoff) SQL function.
+    governance_retention_days: int = 2555
 
 
 def _read_required_env(name: str) -> str:
@@ -231,6 +236,9 @@ def get_security_settings() -> SecuritySettings:
         course_scoped_authz_enabled=(
             os.getenv("ATTENDANCE_COURSE_SCOPED_AUTHZ", "false").strip().lower()
             in {"1", "true", "yes"}
+        ),
+        governance_retention_days=_read_positive_int_env(
+            "ATTENDANCE_GOVERNANCE_RETENTION_DAYS", 2555
         ),
     )
 

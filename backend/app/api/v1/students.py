@@ -19,6 +19,7 @@ from app.core.database import get_async_session
 from app.domain.models import Student, StudentEmbedding, TemplateAuditLog
 from app.domain.schemas import StudentCreate, StudentEnrollmentRead, StudentRead, StudentUpdate
 from app.services.enrollment_quality import _resolve_enrollment_min_quality
+from app.services.audit_service import AuditEvent, AuditService, GovernanceAction
 from app.services.pipeline_service import extract_enrollment_embedding
 from app.services.student_service import StudentLinkValidationError, StudentService
 from app.infrastructure.triton import (
@@ -111,11 +112,11 @@ async def _decode_enrollment_image(image_file: UploadFile) -> np.ndarray:
 )
 async def create_student(
     payload: StudentCreate,
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> StudentRead:
     """Create one student profile with linked-user validation."""
-    service = StudentService(session)
+    service = StudentService(session, actor=current_user)
 
     try:
         return await service.create_student(payload)
@@ -183,7 +184,7 @@ async def get_student(
 )
 async def enroll_student_template(
     student_id: UUID,
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
     image_file: Annotated[UploadFile, File(description="Image file used for enrollment.")],
     pose_label: Annotated[str | None, Form(max_length=32)] = None,
@@ -339,6 +340,24 @@ async def enroll_student_template(
                 event_metadata={"source": "students_enroll_api_v1"},
             )
         )
+        # ATT-006: TEMPLATE_ENROLL is a mandatory governance event (D1) and
+        # joins this same transaction — flush-only, committed by the single
+        # commit below (the TemplateAuditLog same-tx pattern with a second
+        # row type). Summary carries the quality score and pose label, NEVER
+        # any vector material.
+        await AuditService(session).emit(
+            AuditEvent(
+                action=GovernanceAction.TEMPLATE_ENROLL,
+                entity_type="student_embedding",
+                entity_id=created_embedding.id,
+                actor_user_id=current_user.id,
+                change_summary={
+                    "pose_label": normalized_pose_label,
+                    "quality_score": float(quality_score),
+                    "replaced_count": len(active_pose_embeddings),
+                },
+            )
+        )
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
@@ -368,11 +387,11 @@ async def enroll_student_template(
 async def update_student(
     student_id: UUID,
     payload: StudentUpdate,
-    _: CurrentInstructorUser,
+    current_user: CurrentInstructorUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> StudentRead:
     """Apply partial updates to an existing student profile."""
-    service = StudentService(session)
+    service = StudentService(session, actor=current_user)
 
     try:
         updated = await service.update_student(student_id, payload)
@@ -396,12 +415,12 @@ async def update_student(
 )
 async def delete_student(
     student_id: UUID,
-    _: CurrentAdminUser,
+    current_user: CurrentAdminUser,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> Response:
     """Delete a student profile with administrator privileges."""
-    service = StudentService(session)
-    deleted = await service.delete(student_id)
+    service = StudentService(session, actor=current_user)
+    deleted = await service.delete_student(student_id)
 
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found.")

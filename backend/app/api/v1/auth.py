@@ -25,11 +25,14 @@ from app.core.security import (
     blocklist_token,
     create_access_token,
     create_refresh_token,
+    decode_token,
     get_security_settings,
+    is_token_blocklisted,
     validate_token,
     verify_password,
 )
 from app.domain.models import User, UserRole
+from app.services.audit_service import AuditEvent, GovernanceAction, emit, resolve_request_context
 
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -263,6 +266,28 @@ async def _revoke_token_if_valid(token: str | None, expected_type: TokenType, re
     await blocklist_token(jti=claims.jti, expires_at=claims.expires_at, reason=reason)
 
 
+async def _refresh_reuse_claims(raw_token: str | None) -> TokenClaims | None:
+    """Return refresh-token claims when the rejection was specifically a REPLAY.
+
+    ``validate_token`` rejects revoked tokens with a generic SecurityError.
+    A replay is the narrower case where the token still decodes (valid
+    signature, valid type, not expired) but its jti sits in the blocklist.
+    Expired/garbage tokens are NOT replays and produce no governance row
+    (same rationale as D6's failed-login rule).
+    """
+    if raw_token is None or not raw_token.strip():
+        return None
+    try:
+        claims = decode_token(raw_token.strip())
+        if claims.token_type != "refresh":
+            return None
+        if not await is_token_blocklisted(claims.jti):
+            return None
+        return claims
+    except Exception:
+        return None
+
+
 @router.post(
     "/login",
     response_model=SessionResponse,
@@ -271,6 +296,7 @@ async def _revoke_token_if_valid(token: str | None, expected_type: TokenType, re
 )
 async def login(
     payload: LoginRequest,
+    request: Request,
     response: Response,
     session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> SessionResponse:
@@ -290,6 +316,9 @@ async def login(
         user=user,
         submitted_password=payload.password,
     ):
+        # D6: failed logins intentionally produce NO governance rows (PII +
+        # volume + brute-force amplification). Aggregated counters/metrics are
+        # the follow-up; see ATT-006 design Q6.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -300,6 +329,25 @@ async def login(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User account is inactive.",
         )
+
+    # Advisory LOGIN_SUCCEEDED (D1): log-and-continue. Emitted BEFORE any
+    # business write we must keep — a failed advisory flush rolls back the
+    # (so far empty) transaction to keep the session usable. IP is captured
+    # here per D4 (auth events only) as signature evidence.
+    request_id, client_ip = resolve_request_context(request)
+    await emit(
+        session,
+        AuditEvent(
+            action=GovernanceAction.LOGIN_SUCCEEDED,
+            entity_type="auth_session",
+            entity_id=user.id,
+            actor_user_id=user.id,
+            change_summary={"method": "password"},
+            request_id=request_id,
+            ip_address=client_ip,
+        ),
+        strict=False,
+    )
 
     user.last_login_at = datetime.now(tz=UTC)
 
@@ -349,6 +397,28 @@ async def refresh_session(
             expected_token_type="refresh",
         )
     except SecurityError as exc:
+        # Replay detection (D1): the token decoded fine on a first pass but
+        # its jti is blocklisted — this IS the reuse signal, so record it
+        # even though the request itself is denied. jti appears only as an
+        # 8-char prefix; no token material. Expired/garbage tokens are not
+        # replays and stay row-less (D6 rationale).
+        replay_claims = await _refresh_reuse_claims(raw_refresh_token)
+        if replay_claims is not None:
+            replay_user_id = await session.scalar(
+                select(User.id).where(User.id == replay_claims.sub)
+            )
+            await emit(
+                session,
+                AuditEvent(
+                    action=GovernanceAction.REFRESH_REUSED,
+                    entity_type="auth_session",
+                    entity_id=replay_user_id,
+                    actor_user_id=replay_user_id,
+                    change_summary={"jti_prefix": f"{replay_claims.jti[:8]}…"},
+                ),
+                strict=True,
+            )
+            await session.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token is invalid or expired.",
@@ -375,6 +445,22 @@ async def refresh_session(
     )
 
     if not revoked:
+        # Race backstop for the same replay signal recorded in the
+        # SecurityError handler above: two concurrent /refresh calls can both
+        # pass validate_token before either blocklists; exactly one wins the
+        # SET NX here, and the loser records REFRESH_REUSED.
+        await emit(
+            session,
+            AuditEvent(
+                action=GovernanceAction.REFRESH_REUSED,
+                entity_type="auth_session",
+                entity_id=user.id,
+                actor_user_id=user.id,
+                change_summary={"jti_prefix": f"{refresh_claims.jti[:8]}…"},
+            ),
+            strict=True,
+        )
+        await session.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has already been used.",
@@ -446,7 +532,8 @@ async def issue_websocket_ticket(current_user: CurrentUser) -> WebSocketTicketRe
 async def logout(
     request: Request,
     response: Response,
-    _current_user: CurrentUser,
+    current_user: CurrentUser,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
 ) -> LogoutResponse:
     """Best-effort token revocation followed by deterministic cookie invalidation."""
     settings = get_security_settings()
@@ -461,6 +548,24 @@ async def logout(
         expected_type="refresh",
         reason="logout",
     )
+
+    # Advisory LOGOUT (D1): log-and-continue — a failed audit write must never
+    # turn a logout into an error. IP captured per D4 (auth events only).
+    request_id, client_ip = resolve_request_context(request)
+    await emit(
+        session,
+        AuditEvent(
+            action=GovernanceAction.LOGOUT,
+            entity_type="auth_session",
+            entity_id=current_user.id,
+            actor_user_id=current_user.id,
+            change_summary={},
+            request_id=request_id,
+            ip_address=client_ip,
+        ),
+        strict=False,
+    )
+    await session.commit()
 
     _clear_auth_cookies(response)
 

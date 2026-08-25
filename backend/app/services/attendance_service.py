@@ -11,8 +11,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.pubsub import LIVE_ATTENDANCE_CHANNEL, RedisPubSubManager
-from app.domain.models import AttendanceStatus, ClassSessionRecord, Course, Room, Sighting, Student
+from app.domain.models import AttendanceStatus, ClassSessionRecord, Course, Room, Sighting, Student, User
 from app.domain.schemas import ClassSessionListResponse, ClassSessionRecordCreate, ClassSessionRecordUpdate, ClassSessionRosterRecord
+from app.services.audit_service import AuditEvent, AuditService, GovernanceAction
 from app.services.base import AsyncCRUDService
 
 
@@ -41,9 +42,13 @@ class AttendanceService(
         session: AsyncSession,
         *,
         pubsub_manager: RedisPubSubManager | None = None,
+        actor: User | None = None,
     ) -> None:
         super().__init__(session=session, model=ClassSessionRecord)
         self._pubsub_manager = pubsub_manager or RedisPubSubManager()
+        # None (the default) means the system actor — e.g. the Celery
+        # aggregation task. Governance rows then carry actor_user_id IS NULL.
+        self._actor = actor
 
     async def log_sighting(
         self,
@@ -189,6 +194,25 @@ class AttendanceService(
 
         async with self.transaction():
             updated_records = list((await self.session.execute(upsert_stmt)).scalars().all())
+            # ATTENDANCE_EVALUATE is mandatory (D1): the aggregation run that
+            # derives attendance verdicts is itself a governance event, written
+            # in the SAME transaction as the upsert (system actor when the
+            # Celery task constructs this service without an actor). Runs that
+            # find nothing to evaluate return early above and emit no row.
+            await AuditService(self.session).emit(
+                AuditEvent(
+                    action=GovernanceAction.ATTENDANCE_EVALUATE,
+                    entity_type="class_session_record",
+                    entity_id=course_id,
+                    actor_user_id=self._actor.id if self._actor is not None else None,
+                    change_summary={
+                        "source": "celery",
+                        "session_date": date.isoformat(),
+                        "records_upserted": len(updated_records),
+                        "threshold": required_sightings_threshold,
+                    },
+                )
+            )
 
         return updated_records
 
