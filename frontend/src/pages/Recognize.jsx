@@ -1,11 +1,19 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AlertCircle, ImagePlus, RefreshCcw, ScanFace, UploadCloud } from 'lucide-react'
+import { AlertCircle, Camera, ImagePlus, RefreshCcw, ScanFace, UploadCloud } from 'lucide-react'
 import client from '../api/client'
 import AnnotatedImage from '../components/AnnotatedImage'
 
 const RECOGNIZE_ENDPOINT = '/api/v1/inference/photo'
+const BATCH_ENDPOINT = '/api/v1/inference/batch'
 const MAX_FILE_BYTES = 10 * 1024 * 1024 // 10 MB
+
+// Classroom burst capture (multi-frame tracking path)
+const BURST_FRAME_COUNT = 5
+const BURST_FRAME_INTERVAL_MS = 400
+const MAX_TENSOR_SIDE_PX = 640
+const TASK_POLL_INTERVAL_MS = 1500
+const TASK_POLL_MAX_ATTEMPTS = 40
 
 function formatBytes(n) {
   if (n < 1024) return `${n} B`
@@ -13,16 +21,68 @@ function formatBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function uint8ArrayToBase64(bytes) {
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + chunkSize))
+  }
+  return btoa(binary)
+}
+
+function describeFailure(err) {
+  const status = err?.response?.status
+  if (status) return `HTTP ${status}`
+  return err?.message ? 'network error' : 'unknown error'
+}
+
+// Map the async batch task result onto the photo-response shape already
+// rendered by StatsRow / AnnotatedImage / ResultsTable. Rows stay keyed by
+// track_id — the server guarantees unique track ids within one batch.
+function batchResultToPhotoShape(batchResult, frameWidth, frameHeight) {
+  const rows = Array.isArray(batchResult?.results) ? batchResult.results : []
+  const detections = rows.map((row) => ({
+    track_id: row.track_id,
+    bbox: row.bbox,
+    confidence: row.detection_score,
+    liveness_score: row.liveness_score,
+    is_live: row.is_live,
+    match:
+      row.is_match && row.student_id
+        ? {
+            // The batch/task-status API reports student IDs, not names.
+            student_full_name: '',
+            student_number: '',
+            student_id: row.student_id,
+            cosine_similarity: row.cosine_similarity,
+          }
+        : null,
+  }))
+  return {
+    image_width: frameWidth,
+    image_height: frameHeight,
+    detection_count: batchResult?.detection_count ?? detections.length,
+    match_count: detections.filter((det) => det.match).length,
+    processed_at: batchResult?.generated_at,
+    detections,
+  }
+}
+
 function resolveError(err) {
   const status = err?.response?.status
   const detail = err?.response?.data?.detail
-  if (status === 400) return detail || 'Image could not be decoded. Please upload a valid JPEG or PNG.'
   if (status === 401) return '__REDIRECT_LOGIN__'
-  if (status === 403) return 'You do not have permission to use this feature.'
-  if (status === 413) return 'Image exceeds the 10 MB limit. Please choose a smaller file.'
+  if (status === 403) return 'Insufficient role: recognition requires instructor or admin access.'
+  if (status === 413) return 'Capture too large. Please choose an image under the 10 MB limit.'
+  if (status === 400) return detail || 'Image could not be decoded. Please upload a valid JPEG or PNG.'
   if (status === 422) return detail || 'Invalid request parameters.'
   if (status === 503) return 'Recognition service is temporarily unavailable. Please try again shortly.'
-  return detail || err.message || 'An unexpected error occurred.'
+  if (status) return detail || `Request failed with HTTP status ${status}.`
+  return err.message || 'A network error occurred. Check your connection and try again.'
 }
 
 // ── Spinner ────────────────────────────────────────────────────────────────
@@ -142,10 +202,10 @@ function ResultsTable({ detections }) {
                   </span>
                 </td>
                 <td style={{ fontWeight: det.match ? 600 : 400, color: det.match ? 'var(--present-text)' : 'var(--text-subtle)' }}>
-                  {det.match ? det.match.student_full_name : '—'}
+                  {det.match ? det.match.student_full_name || det.match.student_id || '—' : '—'}
                 </td>
                 <td style={{ fontFamily: 'monospace', fontSize: '0.82rem' }}>
-                  {det.match ? det.match.student_number : '—'}
+                  {det.match ? det.match.student_number || '—' : '—'}
                 </td>
                 <td>
                   {det.match?.cosine_similarity != null
@@ -236,6 +296,64 @@ function DropZone({ onFile }) {
   )
 }
 
+// ── Burst Capture Panel ────────────────────────────────────────────────────
+function BurstCapturePanel({ videoRef, isActive, error, busy, onStartCamera, onBurst }) {
+  if (!isActive) {
+    return (
+      <div
+        className="empty-state"
+        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}
+      >
+        <Camera size={40} style={{ color: 'var(--text-subtle)' }} aria-hidden="true" />
+        <p style={{ fontWeight: 600 }}>Camera not started</p>
+        <small>
+          Burst mode captures {BURST_FRAME_COUNT} frames ~{BURST_FRAME_INTERVAL_MS} ms apart from
+          this device&apos;s webcam and runs them through multi-frame tracking.
+        </small>
+        {error && (
+          <div className="alert-banner" role="alert" style={{ width: '100%', marginTop: 4 }}>
+            <span>{error}</span>
+          </div>
+        )}
+        <button
+          type="button"
+          className="solid-btn"
+          style={{ marginTop: 6 }}
+          onClick={onStartCamera}
+          aria-label="Enable webcam for classroom burst capture"
+        >
+          <Camera size={15} aria-hidden="true" />
+          <span>Enable Camera</span>
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        aria-label="Live camera preview for classroom burst capture"
+        style={{
+          width: '100%',
+          maxWidth: 640,
+          borderRadius: 'var(--radius-md)',
+          border: '1px solid var(--border)',
+          background: '#000',
+          display: 'block',
+        }}
+      />
+      <button type="button" className="solid-btn" onClick={onBurst} disabled={busy}>
+        <ScanFace size={15} aria-hidden="true" />
+        <span>{busy ? 'Capturing…' : `Capture ${BURST_FRAME_COUNT}-Frame Burst`}</span>
+      </button>
+    </div>
+  )
+}
+
 // ── Main Page ──────────────────────────────────────────────────────────────
 export default function Recognize() {
   const navigate = useNavigate()
@@ -246,6 +364,15 @@ export default function Recognize() {
   const [previewUrl, setPreviewUrl] = useState(null)
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
+
+  // Classroom burst (multi-frame) mode
+  const [burstMode, setBurstMode] = useState(false)
+  const videoRef = useRef(null)
+  const streamRef = useRef(null)
+  const [cameraActive, setCameraActive] = useState(false)
+  const [cameraError, setCameraError] = useState('')
+  const [burstBusy, setBurstBusy] = useState(false)
+  const [notice, setNotice] = useState('')
 
   const handleFile = useCallback((file) => {
     if (file.size > MAX_FILE_BYTES) {
@@ -260,6 +387,105 @@ export default function Recognize() {
       setStage('preview')
     }
     reader.readAsDataURL(file)
+  }, [])
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+    setCameraActive(false)
+  }, [])
+
+  const startCamera = useCallback(async () => {
+    setCameraError('')
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        audio: false,
+      })
+      streamRef.current = stream
+      setCameraActive(true)
+    } catch (err) {
+      const name = err?.name || ''
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setCameraError('Camera permission was denied. Please allow camera access and try again.')
+      } else if (name === 'NotFoundError') {
+        setCameraError('No camera detected on this device.')
+      } else {
+        setCameraError(err.message || 'Unable to access camera.')
+      }
+    }
+  }, [])
+
+  // Wire the MediaStream once <video> mounts; release the camera on unmount.
+  useEffect(() => {
+    if (cameraActive && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current
+      videoRef.current.play().catch(() => {})
+    }
+  }, [cameraActive])
+
+  useEffect(
+    () => () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop())
+      }
+    },
+    [],
+  )
+
+  // Grab K frames ~400 ms apart from the live webcam, downscaled so the
+  // longest side is capped at MAX_TENSOR_SIDE_PX (aspect preserved). Each
+  // canvas readback yields RGBA via getImageData; the alpha channel is
+  // stripped into a packed RGB uint8 tensor.
+  const captureBurstFrames = useCallback(async () => {
+    const video = videoRef.current
+    if (!video || !video.videoWidth || !video.videoHeight) {
+      throw new Error('Camera frame is not ready yet. Wait for the preview and try again.')
+    }
+
+    const scale = Math.min(1, MAX_TENSOR_SIDE_PX / Math.max(video.videoWidth, video.videoHeight))
+    const width = Math.max(1, Math.round(video.videoWidth * scale))
+    const height = Math.max(1, Math.round(video.videoHeight * scale))
+
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+    let previewDataUrl = ''
+    const captured = []
+    for (let index = 0; index < BURST_FRAME_COUNT; index += 1) {
+      if (index > 0) await sleep(BURST_FRAME_INTERVAL_MS)
+      ctx.drawImage(video, 0, 0, width, height)
+      if (index === 0) previewDataUrl = canvas.toDataURL('image/jpeg', 0.9)
+
+      const rgba = ctx.getImageData(0, 0, width, height).data
+      const rgb = new Uint8Array(width * height * 3)
+      for (let src = 0, dst = 0; src < rgba.length; src += 4) {
+        rgb[dst] = rgba[src]
+        rgb[dst + 1] = rgba[src + 1]
+        rgb[dst + 2] = rgba[src + 2]
+        dst += 3
+      }
+      captured.push({ rgb, width, height })
+    }
+
+    return { frames: captured, canvas, previewUrl: previewDataUrl }
+  }, [])
+
+  const pollBatchTask = useCallback(async (taskId) => {
+    for (let attempt = 0; attempt < TASK_POLL_MAX_ATTEMPTS; attempt += 1) {
+      await sleep(TASK_POLL_INTERVAL_MS)
+      const response = await client.get(`/api/v1/inference/tasks/${taskId}`)
+      const { state, result: taskResult, error } = response.data ?? {}
+      if (state === 'SUCCESS') return taskResult
+      if (state === 'FAILURE' || state === 'REVOKED') {
+        throw new Error(error || 'Multi-frame inference task failed.')
+      }
+    }
+    throw new Error('Timed out waiting for multi-frame inference results.')
   }, [])
 
   const handleRecognize = useCallback(async () => {
@@ -298,13 +524,108 @@ export default function Recognize() {
     }
   }, [selectedFile, navigate])
 
+  const handleBurstSubmit = useCallback(async () => {
+    setBurstBusy(true)
+    setError('')
+    setNotice('')
+
+    let burstCanvas = null
+    try {
+      const { frames, canvas, previewUrl: framePreview } = await captureBurstFrames()
+      burstCanvas = canvas
+      setPreviewUrl(framePreview)
+      setStage('loading')
+
+      const payload = {
+        frames: frames.map((frame, index) => ({
+          frame_id: `kiosk-burst-${Date.now()}-${index}`,
+          data_base64: uint8ArrayToBase64(frame.rgb),
+          width: frame.width,
+          height: frame.height,
+          channels: 3,
+          dtype: 'uint8',
+          normalize: true,
+        })),
+      }
+
+      const response = await client.post(BATCH_ENDPOINT, payload, { timeout: 30000 })
+      if (response.status !== 202) {
+        throw new Error(`Batch endpoint returned unexpected status ${response.status}.`)
+      }
+
+      const taskId = response.data?.task_id
+      if (!taskId) throw new Error('Batch endpoint did not return a task id.')
+
+      const batchResult = await pollBatchTask(taskId)
+      setResult(batchResultToPhotoShape(batchResult, frames[0].width, frames[0].height))
+      setPreviewUrl(framePreview)
+      setStage('result')
+    } catch (batchErr) {
+      // Batch path failed (non-202, network, or failed task): fall back to the
+      // existing single-frame photo flow with a captured frame and say so.
+      if (!burstCanvas) {
+        const msg =
+          batchErr?.message || 'Burst capture failed before any frame could be read from the camera.'
+        setError(msg)
+        setStage('idle')
+        return
+      }
+      try {
+        const blob = await new Promise((resolve, reject) => {
+          burstCanvas.toBlob(
+            (b) => (b ? resolve(b) : reject(new Error('Could not encode the captured frame.'))),
+            'image/jpeg',
+            0.92,
+          )
+        })
+        const formData = new FormData()
+        formData.append('file', blob, 'kiosk-burst-frame.jpg')
+        const response = await client.post(RECOGNIZE_ENDPOINT, formData, {
+          headers: { 'Content-Type': undefined }, // ATT-034 — see handleRecognize
+          timeout: 60000,
+        })
+        setNotice(
+          `Multi-frame batch unavailable (${describeFailure(batchErr)}) — showing a single-frame result instead.`,
+        )
+        setResult(response.data)
+        setPreviewUrl(burstCanvas.toDataURL('image/jpeg', 0.92))
+        setStage('result')
+      } catch (fallbackErr) {
+        const msg = resolveError(fallbackErr)
+        if (msg === '__REDIRECT_LOGIN__') {
+          navigate('/login')
+          return
+        }
+        setError(msg)
+        setNotice(`Multi-frame batch unavailable (${describeFailure(batchErr)}).`)
+        setStage('idle')
+      }
+    } finally {
+      setBurstBusy(false)
+    }
+  }, [captureBurstFrames, pollBatchTask, navigate])
+
+  const handleBurstToggle = useCallback(
+    (event) => {
+      const enabled = event.target.checked
+      setBurstMode(enabled)
+      setError('')
+      setNotice('')
+      setCameraError('')
+      if (!enabled) stopCamera()
+    },
+    [stopCamera],
+  )
+
   const handleReset = useCallback(() => {
     setStage('idle')
     setSelectedFile(null)
     setPreviewUrl(null)
     setError('')
     setResult(null)
-  }, [])
+    setNotice('')
+    if (burstMode) stopCamera()
+  }, [burstMode, stopCamera])
 
   return (
     <section className="surface-card">
@@ -333,9 +654,65 @@ export default function Recognize() {
         </div>
       )}
 
-      {/* ── Idle: show drop zone ──────────────────────────────────────── */}
+      {/* Fallback notice (batch mode degraded to single-frame) */}
+      {notice && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '8px 12px',
+            borderRadius: 'var(--radius-sm)',
+            background: 'var(--surface-muted)',
+            border: '1px solid var(--border)',
+            color: 'var(--text-soft)',
+            fontSize: '0.84rem',
+            fontWeight: 500,
+          }}
+        >
+          <span>{notice}</span>
+        </div>
+      )}
+
+      {/* ── Idle: drop zone, or webcam burst panel when enabled ───────── */}
       {stage === 'idle' && (
-        <DropZone onFile={handleFile} />
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <label
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 8,
+              fontSize: '0.88rem',
+              fontWeight: 600,
+              color: 'var(--text-soft)',
+              cursor: 'pointer',
+              alignSelf: 'flex-start',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={burstMode}
+              disabled={burstBusy}
+              onChange={handleBurstToggle}
+            />
+            Classroom burst (multi-frame)
+          </label>
+
+          {burstMode ? (
+            <BurstCapturePanel
+              videoRef={videoRef}
+              isActive={cameraActive}
+              error={cameraError}
+              busy={burstBusy}
+              onStartCamera={startCamera}
+              onBurst={handleBurstSubmit}
+            />
+          ) : (
+            <DropZone onFile={handleFile} />
+          )}
+        </div>
       )}
 
       {/* ── Preview: show image + file info + submit button ───────────── */}
@@ -406,7 +783,13 @@ export default function Recognize() {
               justifyContent: 'center',
             }}
           >
-            <Spinner label="Running recognition pipeline..." />
+            <Spinner
+              label={
+                burstMode
+                  ? 'Running multi-frame batch pipeline...'
+                  : 'Running recognition pipeline...'
+              }
+            />
           </div>
         </div>
       )}
