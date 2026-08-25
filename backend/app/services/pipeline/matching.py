@@ -12,14 +12,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
 from app.domain.models import Student, StudentEmbedding
+from app.services.pipeline.settings import get_pipeline_settings
 
 
-STRICT_SIMILARITY_THRESHOLD = 0.85
+# ATT-077: the identity-acceptance threshold lives in PipelineSettings
+# (``match_threshold``, env override ATTENDANCE_MATCH_THRESHOLD) and is read
+# from there at point of use by BOTH code paths below — never hardcode it.
 
 
 # ATT-048: per-query ef_search cap for HNSW index scans. pgvector's default
 # is 40, which is the chapter sweet-spot for moderate-sized corpuses but has
-# been measured to drop recall below STRICT_SIMILARITY_THRESHOLD (0.85) on
+# been measured to drop recall below the identity-match threshold (see
+# ``match_threshold`` in pipeline settings) on
 # 10k+ students with multiple poses — a 0.86 true-NN falls outside the
 # candidate list at ef_search=40 and gets returned as "no match" (which
 # logs an unknown-face Sighting). Setting ef_search=100 lets the dynamic
@@ -82,7 +86,7 @@ async def _resolve_nearest_embedding_match(
     if not math.isfinite(cosine_similarity):
         return EmbeddingMatch(student_id=None, embedding_id=None, cosine_similarity=None)
 
-    if cosine_similarity < STRICT_SIMILARITY_THRESHOLD:
+    if cosine_similarity < get_pipeline_settings().match_threshold:
         return EmbeddingMatch(
             student_id=None,
             embedding_id=nearest_row.id,
@@ -134,7 +138,7 @@ def _classify_match(
     if cosine_similarity is None or not math.isfinite(cosine_similarity):
         return EmbeddingMatch(student_id=None, embedding_id=None, cosine_similarity=None)
 
-    if cosine_similarity < STRICT_SIMILARITY_THRESHOLD:
+    if cosine_similarity < get_pipeline_settings().match_threshold:
         return EmbeddingMatch(
             student_id=None,
             embedding_id=embedding_id,

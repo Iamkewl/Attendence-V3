@@ -15,7 +15,7 @@ from .detection import Detection, _parse_detections
 from .embedding import _decode_embeddings, _identity_from_embedding
 from .frame import _crop_face, _decode_frame_tensor, _frame_to_model_input, _prepare_face_batch, _resize_nearest
 from .liveness import _decode_liveness_scores
-from .matching import STRICT_SIMILARITY_THRESHOLD, _resolve_vector_matches
+from .matching import _resolve_vector_matches
 from .settings import PipelineSettings, get_pipeline_settings
 from .tracking import TrackedDetection, _track_detections
 
@@ -294,7 +294,7 @@ async def process_inference_batch(
             "matched_embedding_id": (
                 str(embedding_match.embedding_id) if embedding_match.embedding_id is not None else None
             ),
-            "match_threshold": STRICT_SIMILARITY_THRESHOLD,
+            "match_threshold": settings.match_threshold,
             "identity": _identity_from_embedding(embedding),
         }
 
