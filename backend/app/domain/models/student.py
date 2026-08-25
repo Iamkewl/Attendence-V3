@@ -13,6 +13,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     SmallInteger,
     String,
     UniqueConstraint,
@@ -115,6 +116,10 @@ class StudentEmbedding(UUIDPrimaryKeyMixin, Base):
         nullable=False,
         server_default=text("1.0"),
     )
+    # Version of the embedding pipeline that produced this template
+    # (D13, migration 20260824_0005). NULL = pre-column enrollment with no
+    # provenance; the bulk importer stamps it from --template-version.
+    template_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
