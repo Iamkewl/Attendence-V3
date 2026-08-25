@@ -27,6 +27,7 @@ no longer advertises them as public.
 from .pipeline import (  # noqa: F401
     Detection,
     EmbeddingMatch,
+    NoFaceDetectedError,
     PipelineSettings,
     STRICT_SIMILARITY_THRESHOLD,
     TrackedDetection,
@@ -38,6 +39,7 @@ from .pipeline import (  # noqa: F401
 __all__ = [
     "Detection",
     "EmbeddingMatch",
+    "NoFaceDetectedError",
     "PipelineSettings",
     "STRICT_SIMILARITY_THRESHOLD",
     "TrackedDetection",

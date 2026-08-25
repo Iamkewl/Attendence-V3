@@ -23,6 +23,17 @@ from .tracking import TrackedDetection, _track_detections
 LOGGER = logging.getLogger(__name__)
 
 
+class NoFaceDetectedError(ValueError):
+    """Raised when enrollment extraction is asked to require a detection.
+
+    The bulk importer passes ``require_detection=True`` so an image with
+    zero YOLO detections becomes an explicit NO_FACE reject instead of the
+    legacy whole-frame-resize fallback, which would happily embed a
+    face-less photo as a garbage template. Default behavior (fallback,
+    no raise) is unchanged for the API route.
+    """
+
+
 def _select_output_tensor(
     outputs: dict[str, np.ndarray],
     *,
@@ -59,8 +70,15 @@ async def extract_enrollment_embedding(
     face_tensor: np.ndarray,
     *,
     triton_client: TritonGrpcClient | None = None,
+    require_detection: bool = False,
 ) -> tuple[np.ndarray, float]:
-    """Extract one 512D normalized embedding plus quality proxy from a face image tensor."""
+    """Extract one 512D normalized embedding plus quality proxy from a face image tensor.
+
+    ``require_detection=True`` (used by the bulk enrollment importer)
+    raises :class:`NoFaceDetectedError` when the detector finds zero faces
+    instead of falling back to resizing the whole frame; the default
+    ``False`` preserves the historical API-route behavior exactly.
+    """
     settings = get_pipeline_settings()
     client = triton_client or get_triton_client()
 
@@ -101,6 +119,8 @@ async def extract_enrollment_embedding(
                 settings.face_crop_size,
             )
     else:
+        if require_detection:
+            raise NoFaceDetectedError("No face detected in enrollment image.")
         aligned_face = _resize_nearest(
             normalized_tensor,
             settings.face_crop_size,
