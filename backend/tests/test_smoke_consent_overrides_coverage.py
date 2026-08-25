@@ -853,4 +853,7 @@ def test_reserved_vocabulary_now_implemented() -> None:
     ):
         assert name in IMPLEMENTED_ACTIONS, name
         assert GovernanceAction[name] in MANDATORY_ACTIONS, name
-    assert "EXPORT" not in IMPLEMENTED_ACTIONS, "still reserved (no writer)"
+    # ATT-039 wired the EXPORT writer (migration 20260824_0009) and
+    # classified it advisory — implemented, but deliberately not mandatory.
+    assert "EXPORT" in IMPLEMENTED_ACTIONS, "wired by ATT-039"
+    assert GovernanceAction["EXPORT"] not in MANDATORY_ACTIONS, "advisory"

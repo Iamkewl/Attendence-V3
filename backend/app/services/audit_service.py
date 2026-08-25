@@ -53,11 +53,10 @@ class GovernanceAction(str, Enum):
     """CHECK-constrained event vocabulary (DB constraint ``governance_action_domain``).
 
     Adding a value requires BOTH a new enum member here AND a migration
-    extending the CHECK — deliberate friction (design Q8). Values below the
-    ``reserved`` marker ship in the enum so ATT-044 (consent), ATT-038
-    (overrides), and ATT-045 (retention/export) land without redesigning the
-    vocabulary, but they have no writers yet and are intentionally excluded
-    from the database CHECK until their feature migrations arrive.
+    extending the CHECK — deliberate friction (design Q8). Values ship in the
+    enum ahead of their writers so features land without redesigning the
+    vocabulary, but they stay out of the database CHECK until their feature
+    migration arrives.
     """
 
     USER_CREATE = "USER_CREATE"
@@ -84,13 +83,14 @@ class GovernanceAction(str, Enum):
     OVERRIDE_APPLY = "OVERRIDE_APPLY"
     # ATT-045 embedding retention sweep (system actor):
     EMBED_HARD_DELETE = "EMBED_HARD_DELETE"
-    # --- still reserved (no writer yet; not in the DB CHECK) ---
+    # ATT-039 CSV attendance roster export (migration 20260824_0009 moved it
+    # into the DB CHECK; emission is advisory — see MANDATORY_ACTIONS below).
     EXPORT = "EXPORT"
 
 
 # Implemented vocabulary mirrored by the ``governance_action_domain`` CHECK
-# constraint (migration 20260824_0008, extending 0007). EXPORT stays reserved
-# until its feature migration arrives.
+# constraint (migration 20260824_0009, extending 0008). Every enum member now
+# has a live writer.
 IMPLEMENTED_ACTIONS: frozenset[str] = frozenset(
     {
         GovernanceAction.USER_CREATE.value,
@@ -113,6 +113,7 @@ IMPLEMENTED_ACTIONS: frozenset[str] = frozenset(
         GovernanceAction.CONSENT_DENIED.value,
         GovernanceAction.OVERRIDE_APPLY.value,
         GovernanceAction.EMBED_HARD_DELETE.value,
+        GovernanceAction.EXPORT.value,
     }
 )
 
@@ -134,8 +135,9 @@ ENTITY_TYPES: frozenset[str] = frozenset(
 GOVERNANCE_RETENTION_DEFAULT_DAYS = 2555
 
 # Decision D1: lifecycle events fail-the-op; auth/inference side-effects and
-# TASK_READ are log-and-continue. Reserved future actions (consent, override,
-# export, embed hard-delete) are mandatory by policy ahead of their wiring.
+# TASK_READ are log-and-continue. ATT-039 deliberately classifies EXPORT as
+# ADVISORY: a governance-ledger hiccup must never block delivery of a roster
+# the requester is already authorized to see (log-and-continue).
 MANDATORY_ACTIONS: frozenset[GovernanceAction] = frozenset(
     {
         GovernanceAction.USER_CREATE,
@@ -152,7 +154,6 @@ MANDATORY_ACTIONS: frozenset[GovernanceAction] = frozenset(
         GovernanceAction.CONSENT_DENIED,
         GovernanceAction.OVERRIDE_APPLY,
         GovernanceAction.EMBED_HARD_DELETE,
-        GovernanceAction.EXPORT,
     }
 )
 
