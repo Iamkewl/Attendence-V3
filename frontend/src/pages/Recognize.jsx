@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlertCircle, Camera, ImagePlus, RefreshCcw, ScanFace, UploadCloud } from 'lucide-react'
 import client from '../api/client'
+import { resolveError } from './recognizeErrors'
 import AnnotatedImage from '../components/AnnotatedImage'
 
 const RECOGNIZE_ENDPOINT = '/api/v1/inference/photo'
@@ -70,19 +71,6 @@ function batchResultToPhotoShape(batchResult, frameWidth, frameHeight) {
     processed_at: batchResult?.generated_at,
     detections,
   }
-}
-
-function resolveError(err) {
-  const status = err?.response?.status
-  const detail = err?.response?.data?.detail
-  if (status === 401) return '__REDIRECT_LOGIN__'
-  if (status === 403) return 'Insufficient role: recognition requires instructor or admin access.'
-  if (status === 413) return 'Capture too large. Please choose an image under the 10 MB limit.'
-  if (status === 400) return detail || 'Image could not be decoded. Please upload a valid JPEG or PNG.'
-  if (status === 422) return detail || 'Invalid request parameters.'
-  if (status === 503) return 'Recognition service is temporarily unavailable. Please try again shortly.'
-  if (status) return detail || `Request failed with HTTP status ${status}.`
-  return err.message || 'A network error occurred. Check your connection and try again.'
 }
 
 // ── Spinner ────────────────────────────────────────────────────────────────
@@ -743,7 +731,7 @@ export default function Recognize() {
           <div style={{ borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '1px solid var(--border)' }}>
             <img
               src={previewUrl}
-              alt="Selected photo preview"
+              alt="Selected file preview"
               style={{ display: 'block', width: '100%', height: 'auto' }}
             />
           </div>
