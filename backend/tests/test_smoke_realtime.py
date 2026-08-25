@@ -39,6 +39,7 @@ def test_websocket_accepts_valid_ticket() -> None:
     that is the load-bearing cap-assignable identity.
     """
     import json
+    import os
     import redis
     import app.core.security as security
     import app.api.v1.websockets as ws_module
@@ -52,7 +53,15 @@ def test_websocket_accepts_valid_ticket() -> None:
     # Issue ticket synchronously (same Redis instance, different client type).
     # Payload matches /auth/ws-ticket's emission shape in backend/app/api/v1/
     # auth.py: json.dumps({"user_id": str(current_user.id), "issued_at": ...})
-    r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+    # Resolve the DB number from the configured URL instead of hardcoding db=0:
+    # environments that isolate runs via ATTENDANCE_REDIS_URL(_TEST)=.../N were
+    # writing the ticket to one DB while the app consumed tickets from another.
+    redis_url = (
+        os.environ.get("ATTENDANCE_REDIS_URL_TEST")
+        or os.environ.get("ATTENDANCE_REDIS_URL")
+        or "redis://localhost:6379/0"
+    )
+    r = redis.Redis.from_url(redis_url, decode_responses=True)
     payload = json.dumps(
         {"user_id": user_id, "issued_at": "2026-07-29T00:00:00+00:00"},
         separators=(",", ":"),

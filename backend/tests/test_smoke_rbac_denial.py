@@ -17,6 +17,14 @@ OPERATOR) is defined and exported in deps.py but used by zero routes
 (tracked as ATT-076) -- it has nothing to deny-test against and is
 intentionally absent below.
 
+ATT-016 note: GET /attendance/sessions (listed under UNAUTHENTICATED_ROUTES)
+is additionally guarded by the flag-gated CourseScopedPrincipal dependency
+(backend/app/api/deps.py). With ATTENDANCE_COURSE_SCOPED_AUTHZ at its default
+(off) its behavior stays exactly as registered here; when the flag is on the
+route becomes course-scoped and its denial matrix lives in
+test_smoke_att016_course_scoped_authz.py, because this static registry can
+only express one fixed mode.
+
 Fixture note: the `auditor_user` fixture in conftest.py provisions an
 AUDITOR account. It is used below purely as "a caller who is neither
 ADMIN nor INSTRUCTOR" -- comments call out the AUDITOR role explicitly

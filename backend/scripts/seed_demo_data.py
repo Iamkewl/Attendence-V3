@@ -24,6 +24,11 @@ import uuid
 # Fixed deterministic UUIDs so re-runs are always idempotent.
 DEMO_COURSE_ID = uuid.UUID("00000000-0000-4000-a000-000000000001")
 DEMO_ADMIN_ID = uuid.UUID("00000000-0000-4000-a000-000000000002")
+# ATT-016: deterministic owner link binding the demo admin to the demo
+# course, so `make demo` keeps working once ATTENDANCE_COURSE_SCOPED_AUTHZ
+# is flipped on. Deliberately NOT bound to the five INSTRUCTOR-roled demo
+# student accounts — those must not inherit instructor-grade read paths.
+DEMO_COURSE_INSTRUCTOR_ID = uuid.UUID("00000000-0000-4000-a000-000000000003")
 DEMO_STUDENT_IDS = [
     uuid.UUID(f"00000000-0000-4000-a000-0000000000{10 + i:02d}")
     for i in range(5)
@@ -101,7 +106,7 @@ async def seed() -> None:
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
     from app.core.security import hash_password
-    from app.domain.models import User, UserRole, Course, Student
+    from app.domain.models import User, UserRole, Course, CourseInstructor, Student
 
     _check_demo_mode_or_exit()
 
@@ -161,6 +166,21 @@ async def seed() -> None:
             created.append("Course DEMO-101")
         else:
             skipped.append("Course DEMO-101 — already exists")
+
+        # --- Demo course owner link (ATT-016) ---
+        existing_link = await session.get(CourseInstructor, DEMO_COURSE_INSTRUCTOR_ID)
+        if existing_link is None:
+            session.add(
+                CourseInstructor(
+                    id=DEMO_COURSE_INSTRUCTOR_ID,
+                    course_id=DEMO_COURSE_ID,
+                    user_id=DEMO_ADMIN_ID,
+                    role_in_course="owner",
+                )
+            )
+            created.append("CourseInstructor admin@attendance.demo -> DEMO-101 (owner)")
+        else:
+            skipped.append("CourseInstructor admin@attendance.demo -> DEMO-101 — already exists")
 
         # --- Demo students (each needs a User row first) ---
         for i in range(5):

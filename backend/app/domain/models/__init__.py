@@ -16,6 +16,7 @@ from ._base import (  # noqa: F401
 from .user import User  # noqa: F401
 from .student import Student, StudentEmbedding, TemplateAuditLog  # noqa: F401
 from .course import Course  # noqa: F401
+from .course_instructor import CourseInstructor  # noqa: F401
 from .room import Room  # noqa: F401
 from .sighting import Sighting  # noqa: F401
 from .session import ClassSessionRecord  # noqa: F401
@@ -30,6 +31,7 @@ __all__ = [
     "Base",
     "ClassSessionRecord",
     "Course",
+    "CourseInstructor",
     "GovernanceLog",
     "MODEL_METADATA",
     "Room",

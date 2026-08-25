@@ -90,6 +90,10 @@ class SecuritySettings:
     access_cookie_name: str
     refresh_cookie_name: str
     cookie_domain: str | None
+    # ATT-016 feature flag (decisions D9): course-scoped authorization for the
+    # attendance roster route. Default False keeps legacy behavior; flipping it
+    # requires a process restart because SecuritySettings is cached (lru_cache).
+    course_scoped_authz_enabled: bool = False
 
 
 def _read_required_env(name: str) -> str:
@@ -224,6 +228,10 @@ def get_security_settings() -> SecuritySettings:
         access_cookie_name=os.getenv("ATTENDANCE_ACCESS_COOKIE_NAME", "attendance_access_token"),
         refresh_cookie_name=os.getenv("ATTENDANCE_REFRESH_COOKIE_NAME", "attendance_refresh_token"),
         cookie_domain=cookie_domain.strip() if cookie_domain and cookie_domain.strip() else None,
+        course_scoped_authz_enabled=(
+            os.getenv("ATTENDANCE_COURSE_SCOPED_AUTHZ", "false").strip().lower()
+            in {"1", "true", "yes"}
+        ),
     )
 
 
