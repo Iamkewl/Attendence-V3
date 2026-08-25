@@ -161,10 +161,12 @@ jobs:
       - name: Assert head revision reached
         working-directory: backend
         run: |
+          head_rev="$(alembic heads | awk '{print $1}' | head -n 1)"
           current="$(alembic current)"
+          echo "alembic heads -> ${head_rev}"
           echo "alembic current -> ${current}"
-          echo "${current}" | grep -q "20260519_0004" || {
-            echo "FAIL: expected revision 20260519_0004 after 'alembic upgrade head', got: ${current}" >&2
+          echo "${current}" | grep -q "${head_rev}" || {
+            echo "FAIL: expected revision ${head_rev} after 'alembic upgrade head', got: ${current}" >&2
             exit 1
           }
           echo "${current}" | grep -q "(head)" || {
@@ -201,8 +203,8 @@ jobs:
         run: |
           current="$(alembic current)"
           echo "alembic current -> ${current}"
-          echo "${current}" | grep -q "20260519_0004" || {
-            echo "FAIL: expected revision 20260519_0004 after re-running 'alembic upgrade head', got: ${current}" >&2
+          echo "${current}" | grep -q "${head_rev}" || {
+            echo "FAIL: expected revision ${head_rev} after re-running 'alembic upgrade head', got: ${current}" >&2
             exit 1
           }
           echo "${current}" | grep -q "(head)" || {
