@@ -19,6 +19,11 @@ from app.services.base import AsyncCRUDService
 
 LOGGER = logging.getLogger(__name__)
 
+# Fresh rows created by a manual override carry the same default threshold
+# the beat evaluator and roster listing use; any later aggregation run
+# overwrites it with the course's configured threshold anyway.
+_MANUAL_OVERRIDE_DEFAULT_THRESHOLD = 3
+
 
 class AttendanceServiceError(Exception):
     """Base error type for attendance service-level failures."""
@@ -301,6 +306,93 @@ class AttendanceService(
             required_sightings_threshold=threshold,
             records=records,
         )
+
+    async def apply_manual_override(
+        self,
+        *,
+        course_id: UUID,
+        student_id: UUID,
+        status: AttendanceStatus,
+        reason: str,
+    ) -> tuple[ClassSessionRecord, AttendanceStatus | None]:
+        """Upsert TODAY's class-session record for one student (ATT-038).
+
+        Manual overrides are last-write-wins and idempotent: re-submitting
+        the same verdict updates ``status``/``notes``/``evaluated_at`` and
+        emits a fresh OVERRIDE_APPLY event. Only PRESENT/ABSENT are accepted;
+        'late'/'excused' stay evaluator-managed. The OVERRIDE_APPLY governance
+        row is MANDATORY (D1) and joins this same transaction — an override
+        can never land without its evidence. ``class_session_record_id``
+        finally gets a writer (design §1.2), so auditors can trace exactly
+        which roster row was overridden.
+
+        Returns ``(record, previous_status)`` where ``previous_status`` is
+        None when no aggregated row existed yet (the override creates one).
+        """
+        if status not in (AttendanceStatus.PRESENT, AttendanceStatus.ABSENT):
+            raise AttendanceValidationError(
+                "Manual overrides accept only 'present' or 'absent'."
+            )
+        if not reason.strip():
+            raise AttendanceValidationError("An override reason is required.")
+
+        await self._require_course(course_id)
+        await self._require_student(student_id)
+
+        session_date = datetime.now(tz=UTC).date()
+        evaluated_at = datetime.now(tz=UTC)
+
+        async with self.transaction():
+            previous_status = await self.session.scalar(
+                select(ClassSessionRecord.status)
+                .where(ClassSessionRecord.student_id == student_id)
+                .where(ClassSessionRecord.course_id == course_id)
+                .where(ClassSessionRecord.session_date == session_date)
+            )
+
+            insert_stmt = pg_insert(ClassSessionRecord).values(
+                student_id=student_id,
+                course_id=course_id,
+                session_date=session_date,
+                status=status,
+                sighting_count=0,
+                required_sightings_threshold=_MANUAL_OVERRIDE_DEFAULT_THRESHOLD,
+                evaluated_at=evaluated_at,
+                notes=f"manual_override: {reason.strip()}",
+            )
+            upsert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=[
+                    ClassSessionRecord.student_id,
+                    ClassSessionRecord.course_id,
+                    ClassSessionRecord.session_date,
+                ],
+                set_={
+                    "status": insert_stmt.excluded.status,
+                    "notes": insert_stmt.excluded.notes,
+                    "evaluated_at": insert_stmt.excluded.evaluated_at,
+                },
+            ).returning(ClassSessionRecord)
+
+            record = (await self.session.execute(upsert_stmt)).scalar_one()
+
+            await AuditService(self.session).emit(
+                AuditEvent(
+                    action=GovernanceAction.OVERRIDE_APPLY,
+                    entity_type="class_session_record",
+                    entity_id=record.id,
+                    class_session_record_id=record.id,
+                    actor_user_id=self._actor.id if self._actor is not None else None,
+                    reason=reason.strip(),
+                    change_summary={
+                        "student_id": str(student_id),
+                        "session_date": session_date.isoformat(),
+                        "from": previous_status.value if previous_status else None,
+                        "to": status.value,
+                    },
+                )
+            )
+
+        return record, previous_status
 
     async def _publish_live_sighting_event(self, sighting: Sighting) -> None:
         """Publish a serialized sighting payload to realtime subscribers."""

@@ -100,6 +100,32 @@ class ClassSessionListResponse(SchemaModel):
     records: list[ClassSessionRosterRecord]
 
 
+class ClassSessionOverrideRequest(SchemaModel):
+    """Input schema for one manual attendance override (ATT-038).
+
+    ``reason`` is REQUIRED — an override without its evidence defeats the
+    governance ledger that records it (OVERRIDE_APPLY carries it verbatim).
+    Only 'present' and 'absent' are settable by hand; 'late'/'excused'
+    remain evaluator-managed states.
+    """
+
+    student_id: UUID
+    status: Annotated[str, Field(pattern="^(present|absent)$")]
+    reason: Annotated[str, StringConstraints(min_length=3, max_length=2000)]
+
+
+class ClassSessionOverrideRead(SchemaModel):
+    """Output schema for the applied manual override result."""
+
+    id: UUID
+    student_id: UUID
+    course_id: UUID
+    session_date: date
+    status: AttendanceStatus
+    previous_status: AttendanceStatus | None
+    evaluated_at: datetime
+
+
 class GovernanceLogCreate(SchemaModel):
     """Input schema used to append immutable governance audit events."""
 

@@ -76,17 +76,21 @@ class GovernanceAction(str, Enum):
     TASK_READ = "TASK_READ"
     RECOGNITION_RUN = "RECOGNITION_RUN"
     GOVERNANCE_PURGE = "GOVERNANCE_PURGE"  # written only by purge_governance_before() SQL
-    # --- reserved for parked efforts (no writer yet; not in the DB CHECK) ---
+    # ATT-044 consent capture (migration 20260824_0008 wired these writers):
     CONSENT_GRANT = "CONSENT_GRANT"
     CONSENT_WITHDRAW = "CONSENT_WITHDRAW"
+    CONSENT_DENIED = "CONSENT_DENIED"
+    # ATT-038 manual overrides:
     OVERRIDE_APPLY = "OVERRIDE_APPLY"
+    # ATT-045 embedding retention sweep (system actor):
     EMBED_HARD_DELETE = "EMBED_HARD_DELETE"
+    # --- still reserved (no writer yet; not in the DB CHECK) ---
     EXPORT = "EXPORT"
 
 
 # Implemented vocabulary mirrored by the ``governance_action_domain`` CHECK
-# constraint (migration 20260824_0007). Reserved enum members stay out until
-# their feature migrations extend the constraint.
+# constraint (migration 20260824_0008, extending 0007). EXPORT stays reserved
+# until its feature migration arrives.
 IMPLEMENTED_ACTIONS: frozenset[str] = frozenset(
     {
         GovernanceAction.USER_CREATE.value,
@@ -104,6 +108,11 @@ IMPLEMENTED_ACTIONS: frozenset[str] = frozenset(
         GovernanceAction.TASK_READ.value,
         GovernanceAction.RECOGNITION_RUN.value,
         GovernanceAction.GOVERNANCE_PURGE.value,
+        GovernanceAction.CONSENT_GRANT.value,
+        GovernanceAction.CONSENT_WITHDRAW.value,
+        GovernanceAction.CONSENT_DENIED.value,
+        GovernanceAction.OVERRIDE_APPLY.value,
+        GovernanceAction.EMBED_HARD_DELETE.value,
     }
 )
 
@@ -140,6 +149,7 @@ MANDATORY_ACTIONS: frozenset[GovernanceAction] = frozenset(
         GovernanceAction.REFRESH_REUSED,
         GovernanceAction.CONSENT_GRANT,
         GovernanceAction.CONSENT_WITHDRAW,
+        GovernanceAction.CONSENT_DENIED,
         GovernanceAction.OVERRIDE_APPLY,
         GovernanceAction.EMBED_HARD_DELETE,
         GovernanceAction.EXPORT,
@@ -155,6 +165,7 @@ IP_ALLOWED_ACTIONS: frozenset[GovernanceAction] = frozenset(
         GovernanceAction.REFRESH_REUSED,
         GovernanceAction.CONSENT_GRANT,
         GovernanceAction.CONSENT_WITHDRAW,
+        GovernanceAction.CONSENT_DENIED,
     }
 )
 

@@ -4,22 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import exists, or_, select
+from sqlalchemy import delete, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.database import get_session_factory
-from app.domain.models import ClassSessionRecord, Course, Sighting
+from app.domain.models import ClassSessionRecord, Course, Sighting, Student, StudentEmbedding
 from app.domain.schemas import InferenceBatchRequest
 from app.services.attendance_service import (
     AttendanceNotFoundError,
     AttendanceService,
     AttendanceValidationError,
 )
+from app.services.audit_service import AuditEvent, AuditService, GovernanceAction
 from app.services.pipeline_service import process_inference_batch
 from app.worker.celery_app import celery_app
 from app.infrastructure.triton import (
@@ -380,4 +383,164 @@ def demo_emit_sighting(self) -> dict[str, Any]:
     return {"task_state": "SUCCESS", "emitted": emitted}
 
 
-__all__ = ["demo_emit_sighting", "run_inference_pipeline", "task_evaluate_daily_attendance"]
+# ---------------------------------------------------------------------------
+# ATT-045: embedding retention sweep (hard privacy guarantee).
+#
+# Deletes biometric templates in two batches, each emitting ONE system-actor
+# EMBED_HARD_DELETE governance row (batch-level, never per-row volume):
+#   1. retention_expired  — created_at older than the configured horizon
+#                           (ATTENDANCE_EMBEDDING_RETENTION_DAYS, default
+#                           1095 ≈ 3y BIPA-style horizon).
+#   2. consent_withdrawn  — the student's consent is 'withdrawn' or 'denied',
+#                           regardless of age. A recorded refusal or a pulled
+#                           consent must remove the biometric data promptly;
+#                           the horizon never outlives the refusal.
+#
+# Ordering inside one transaction is load-bearing: the governance rows are
+# flushed BEFORE the DELETEs, so a failed audit write aborts the whole sweep
+# (fail-closed — templates are never destroyed without their evidence; the
+# task then surfaces FAILURE for retry). Embedding vectors themselves are
+# never logged anywhere, including these summaries (only counts + reasons).
+#
+# The horizon env var is re-read on every fire (demo-emitter gating pattern)
+# so operators can tighten it without a worker restart. Engine lifecycle per
+# asyncio.run() loop is handled by the shared @task_postrun disposal hook.
+# ---------------------------------------------------------------------------
+
+_EMBEDDING_RETENTION_DEFAULT_DAYS = 1095
+
+
+def _resolve_embedding_retention_days() -> int:
+    """Read the embedding horizon per-run; malformed values fail closed."""
+    raw = os.getenv("ATTENDANCE_EMBEDDING_RETENTION_DAYS")
+    if raw is None or not raw.strip():
+        return _EMBEDDING_RETENTION_DEFAULT_DAYS
+    try:
+        days = int(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            "ATTENDANCE_EMBEDDING_RETENTION_DAYS must be an integer."
+        ) from exc
+    if days < 1:
+        raise RuntimeError(
+            "ATTENDANCE_EMBEDDING_RETENTION_DAYS must be greater than or equal to 1."
+        )
+    return days
+
+
+async def _emit_embed_hard_delete(
+    session: AsyncSession,
+    *,
+    deletion_reason: str,
+    deleted_count: int,
+    cutoff: datetime | None,
+) -> None:
+    """Flush one batch-level system-actor EMBED_HARD_DELETE row."""
+    summary: dict[str, Any] = {
+        "deletion_reason": deletion_reason,
+        "deleted_count": deleted_count,
+        "source": "celery",
+    }
+    if cutoff is not None:
+        summary["cutoff"] = cutoff.isoformat()
+    await AuditService(session).emit(
+        AuditEvent(
+            action=GovernanceAction.EMBED_HARD_DELETE,
+            entity_type="student_embedding",
+            actor_user_id=None,
+            change_summary=summary,
+        )
+    )
+
+
+async def _purge_expired_embeddings(retention_days: int) -> dict[str, Any]:
+    """Delete expired / unconsented embeddings with batch-level audit rows."""
+    now = datetime.now(tz=UTC)
+    cutoff = now - timedelta(days=retention_days)
+
+    summary: dict[str, Any] = {
+        "retention_days": retention_days,
+        "cutoff": cutoff.isoformat(),
+        "retention_deleted": 0,
+        "consent_deleted": 0,
+    }
+    if retention_deleted := await _delete_batch(
+        StudentEmbedding.created_at < cutoff,
+        deletion_reason="retention_expired",
+        cutoff=cutoff,
+    ):
+        summary["retention_deleted"] = retention_deleted
+
+    # Hard privacy guarantee: withdrawn or denied consent purges templates
+    # regardless of age. 'pending' is deliberately NOT purged here — it is
+    # the absence of a decision, not a refusal.
+    if consent_deleted := await _delete_batch(
+        StudentEmbedding.student_id.in_(
+            select(Student.id).where(
+                Student.biometric_consent_status.in_(("withdrawn", "denied"))
+            )
+        ),
+        deletion_reason="consent_not_granted",
+        cutoff=None,
+    ):
+        summary["consent_deleted"] = consent_deleted
+
+    return summary
+
+
+async def _delete_batch(
+    criterion: ColumnElement[bool],
+    *,
+    deletion_reason: str,
+    cutoff: datetime | None,
+) -> int:
+    """Audit-first delete of one embedding batch; returns the deleted count.
+
+    The EMBED_HARD_DELETE row is flushed BEFORE the DELETE executes. If the
+    audit write fails, the exception propagates before any template is
+    removed (fail-closed), rolling the whole sweep back.
+    """
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        candidate_count = await session.scalar(
+            select(func.count(StudentEmbedding.id)).where(criterion)
+        )
+        if not candidate_count:
+            return 0
+
+        await _emit_embed_hard_delete(
+            session,
+            deletion_reason=deletion_reason,
+            deleted_count=candidate_count,
+            cutoff=cutoff,
+        )
+
+        result = await session.execute(delete(StudentEmbedding).where(criterion))
+        await session.commit()
+        return int(result.rowcount or candidate_count)
+
+
+@celery_app.task(bind=True, name="app.worker.tasks.task_purge_expired_embeddings")
+def task_purge_expired_embeddings(self) -> dict[str, Any]:
+    """Celery beat entrypoint: nightly embedding-retention sweep (ATT-045)."""
+    try:
+        retention_days = _resolve_embedding_retention_days()
+        summary = asyncio.run(_purge_expired_embeddings(retention_days))
+    except Exception as exc:
+        LOGGER.exception(
+            "Embedding retention purge failed for task %s.",
+            self.request.id,
+        )
+        raise RuntimeError("Embedding retention purge execution failed.") from exc
+
+    summary["task_id"] = self.request.id
+    summary["task_state"] = "SUCCESS"
+    return summary
+
+
+__all__ = [
+    "demo_emit_sighting",
+    "run_inference_pipeline",
+    "task_evaluate_daily_attendance",
+    "task_purge_expired_embeddings",
+]

@@ -42,6 +42,10 @@ class Student(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "graduation_year IS NULL OR graduation_year >= enrollment_year",
             name="students_graduation_year_valid",
         ),
+        CheckConstraint(
+            "biometric_consent_status IN ('pending','granted','denied','withdrawn')",
+            name="students_biometric_consent_status_domain",
+        ),
         Index("ix_students_enrollment_active", "enrollment_year", "is_active"),
     )
 
@@ -59,6 +63,21 @@ class Student(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean,
         nullable=False,
         server_default=text("true"),
+    )
+    # ATT-044 biometric consent lifecycle. 'pending' is the backfill default:
+    # no recorded decision means NO consent, so enforcement (when the feature
+    # flag is on) refuses template writes for every pre-existing row.
+    biometric_consent_status: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=text("'pending'"),
+    )
+    # UTC timestamp of the latest recorded decision; NULL until a decision is
+    # captured via POST /students/{id}/consent. Consent evidence outlives the
+    # templates it authorizes (governance rows carry the full event trail).
+    biometric_consent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
     user: Mapped[User] = relationship(back_populates="student_profile", lazy="select")

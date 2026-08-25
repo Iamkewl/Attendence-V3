@@ -99,6 +99,17 @@ class SecuritySettings:
     # scheduled purge caller is deferred; the ops path today is the SECURITY
     # DEFINER purge_governance_before(cutoff) SQL function.
     governance_retention_days: int = 2555
+    # ATT-044 feature flag: refuse face-template enrollment unless the
+    # student's biometric_consent_status is 'granted'. Default False keeps
+    # legacy behavior (same rollout posture as course_scoped_authz_enabled,
+    # decision D9); flipping it requires a process restart because
+    # SecuritySettings is cached (lru_cache).
+    enforce_biometric_consent: bool = False
+    # ATT-045: embedding retention horizon in days. BIPA-style 3-year post-
+    # collection horizon cited in docs => default 1095 (~3y). Must stay well
+    # BELOW governance_retention_days (D2) so consent evidence outlives the
+    # templates. Consumed per-run by the retention sweep task.
+    embedding_retention_days: int = 1095
 
 
 def _read_required_env(name: str) -> str:
@@ -239,6 +250,13 @@ def get_security_settings() -> SecuritySettings:
         ),
         governance_retention_days=_read_positive_int_env(
             "ATTENDANCE_GOVERNANCE_RETENTION_DAYS", 2555
+        ),
+        enforce_biometric_consent=(
+            os.getenv("ATTENDANCE_ENFORCE_BIOMETRIC_CONSENT", "false").strip().lower()
+            in {"1", "true", "yes"}
+        ),
+        embedding_retention_days=_read_positive_int_env(
+            "ATTENDANCE_EMBEDDING_RETENTION_DAYS", 1095
         ),
     )
 

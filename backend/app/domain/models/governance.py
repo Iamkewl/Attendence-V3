@@ -41,7 +41,9 @@ class GovernanceLog(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "'TEMPLATE_ENROLL','ATTENDANCE_EVALUATE','REFRESH_REUSED',"
             "'LOGIN_SUCCEEDED','LOGOUT',"
             "'INFERENCE_ENQUEUED','TASK_READ','RECOGNITION_RUN',"
-            "'GOVERNANCE_PURGE')",
+            "'GOVERNANCE_PURGE',"
+            "'CONSENT_GRANT','CONSENT_WITHDRAW','CONSENT_DENIED',"
+            "'OVERRIDE_APPLY','EMBED_HARD_DELETE')",
             name="governance_action_domain",
         ),
         Index("ix_governance_actor_created_at", "actor_user_id", "created_at"),

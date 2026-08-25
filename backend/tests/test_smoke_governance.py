@@ -127,9 +127,11 @@ def test_mandatory_vs_advisory_classification_matrix() -> None:
         "USER_CREATE", "USER_UPDATE", "USER_DELETE",
         "STUDENT_CREATE", "STUDENT_UPDATE", "STUDENT_DELETE",
         "TEMPLATE_ENROLL", "ATTENDANCE_EVALUATE", "REFRESH_REUSED",
-        # reserved future actions are mandatory by policy ahead of wiring
-        "CONSENT_GRANT", "CONSENT_WITHDRAW", "OVERRIDE_APPLY",
-        "EMBED_HARD_DELETE", "EXPORT",
+        # reserved future actions are mandatory by policy ahead of wiring;
+        # ATT-044/038/045 (migration 20260824_0008) wired CONSENT_*/OVERRIDE_
+        # APPLY/EMBED_HARD_DELETE, adding CONSENT_DENIED to the vocabulary.
+        "CONSENT_GRANT", "CONSENT_WITHDRAW", "CONSENT_DENIED",
+        "OVERRIDE_APPLY", "EMBED_HARD_DELETE", "EXPORT",
     }
     advisory = {
         "LOGIN_SUCCEEDED", "LOGOUT", "INFERENCE_ENQUEUED",

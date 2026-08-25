@@ -6,6 +6,7 @@ and threshold env vars below —
 
     ATTENDANCE_CELERY_ATTENDANCE_EVALUATION_INTERVAL_SECONDS
     ATTENDANCE_CELERY_ATTENDANCE_REQUIRED_SIGHTINGS_THRESHOLD
+    ATTENDANCE_CELERY_EMBEDDING_RETENTION_INTERVAL_SECONDS
     ATTENDANCE_DEMO_MODE
     ATTENDANCE_DEMO_SIGHTING_INTERVAL_SECONDS
 
@@ -69,6 +70,7 @@ def _build_beat_schedule(
     attendance_required_sightings_threshold: int,
     demo_mode_enabled: bool,
     demo_sighting_interval_seconds: int,
+    embedding_retention_interval_seconds: int,
 ) -> dict[str, object]:
     """Construct the beat_schedule dict, adding demo entries only when demo mode is active."""
     schedule: dict[str, object] = {
@@ -78,6 +80,18 @@ def _build_beat_schedule(
             "kwargs": {
                 "required_sightings_threshold": attendance_required_sightings_threshold,
             },
+            "options": {
+                "queue": "attendance_aggregation",
+                "routing_key": "attendance.aggregation",
+            },
+        },
+        # ATT-045: daily embedding-retention sweep (expired-horizon and
+        # withdrawn/denied-consent templates). The retention horizon itself
+        # is re-read inside the task on every fire; only the CADENCE is
+        # snapshotted here at app init.
+        "embedding-retention-daily": {
+            "task": "app.worker.tasks.task_purge_expired_embeddings",
+            "schedule": timedelta(seconds=embedding_retention_interval_seconds),
             "options": {
                 "queue": "attendance_aggregation",
                 "routing_key": "attendance.aggregation",
@@ -125,6 +139,11 @@ def get_celery_app() -> Celery:
         3,
         min_value=1,
     )
+    embedding_retention_interval_seconds = _read_int_env(
+        "ATTENDANCE_CELERY_EMBEDDING_RETENTION_INTERVAL_SECONDS",
+        86_400,
+        min_value=60,
+    )
 
     demo_mode_enabled = (
         os.getenv("ATTENDANCE_DEMO_MODE", "").strip().lower() in {"1", "true", "yes"}
@@ -168,12 +187,17 @@ def get_celery_app() -> Celery:
                 "queue": "attendance_aggregation",
                 "routing_key": "attendance.aggregation",
             },
+            "app.worker.tasks.task_purge_expired_embeddings": {
+                "queue": "attendance_aggregation",
+                "routing_key": "attendance.aggregation",
+            },
         },
         beat_schedule=_build_beat_schedule(
             attendance_eval_interval_seconds=attendance_eval_interval_seconds,
             attendance_required_sightings_threshold=attendance_required_sightings_threshold,
             demo_mode_enabled=demo_mode_enabled,
             demo_sighting_interval_seconds=demo_sighting_interval_seconds,
+            embedding_retention_interval_seconds=embedding_retention_interval_seconds,
         ),
         task_track_started=True,
         task_acks_late=True,
