@@ -90,6 +90,25 @@ async def get_current_instructor_user(current_user: CurrentUser) -> User:
     )
 
 
+async def get_current_ingest_user(current_user: CurrentUser) -> User:
+    """Require an authenticated instructor or administrator to submit frames (ATT-075).
+
+    The ingest endpoints (``/inference/stream``, ``/inference/batch``,
+    ``/inference/photo``) are the intake of the biometric pipeline: they
+    accept raw camera frames and produce embeddings/matches. Only roles that
+    own the enrollment and attendance workflows may push frames — AUDITOR is
+    deliberately read-only ("sees-all", decision D5) and OPERATOR is a
+    worker-system principal, so neither has any legitimate ingest path.
+    Mirrors :func:`get_current_governance_reader`: same fail-closed 403 shape,
+    narrower role set.
+    """
+    return _ensure_user_role(
+        current_user,
+        allowed_roles={UserRole.ADMIN, UserRole.INSTRUCTOR},
+        detail="Instructor or administrator privileges are required to submit frames for inference.",
+    )
+
+
 async def get_current_worker_system(current_user: CurrentUser) -> User:
     """Require an authenticated worker-system principal or administrator."""
     return _ensure_user_role(
@@ -115,9 +134,10 @@ async def get_current_governance_reader(current_user: CurrentUser) -> User:
 
 
 CurrentAdminUser = Annotated[User, Depends(get_current_admin_user)]
+CurrentGovernanceReader = Annotated[User, Depends(get_current_governance_reader)]
+CurrentIngestUser = Annotated[User, Depends(get_current_ingest_user)]
 CurrentInstructorUser = Annotated[User, Depends(get_current_instructor_user)]
 CurrentWorkerSystem = Annotated[User, Depends(get_current_worker_system)]
-CurrentGovernanceReader = Annotated[User, Depends(get_current_governance_reader)]
 
 
 _COURSE_ROLE_OWNER = "owner"
@@ -201,6 +221,7 @@ __all__ = [
     "CourseScopedPrincipal",
     "CurrentAdminUser",
     "CurrentGovernanceReader",
+    "CurrentIngestUser",
     "CurrentInstructorUser",
     "CurrentUser",
     "CurrentWorkerSystem",
@@ -208,6 +229,7 @@ __all__ = [
     "get_course_scoped_principal",
     "get_current_admin_user",
     "get_current_governance_reader",
+    "get_current_ingest_user",
     "get_current_instructor_user",
     "get_current_user",
     "get_current_worker_system",

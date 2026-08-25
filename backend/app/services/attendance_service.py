@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID, uuid4
 
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.pubsub import LIVE_ATTENDANCE_CHANNEL, RedisPubSubManager
 from app.domain.models import AttendanceStatus, ClassSessionRecord, Course, Room, Sighting, Student, User
 from app.domain.schemas import ClassSessionListResponse, ClassSessionRecordCreate, ClassSessionRecordUpdate, ClassSessionRosterRecord
-from app.services.audit_service import AuditEvent, AuditService, GovernanceAction
+from app.services.audit_service import AuditEvent, AuditService, GovernanceAction, emit
 from app.services.base import AsyncCRUDService
 
 
@@ -23,6 +24,25 @@ LOGGER = logging.getLogger(__name__)
 # the beat evaluator and roster listing use; any later aggregation run
 # overwrites it with the course's configured threshold anyway.
 _MANUAL_OVERRIDE_DEFAULT_THRESHOLD = 3
+
+# Overrides persist as a notes-prefixed verdict row (ATT-038); the export
+# renders them back out by recognizing this prefix — one source of truth,
+# no duplicated persistence scheme.
+_OVERRIDE_NOTES_PREFIX = "manual_override:"
+
+
+@dataclass(frozen=True)
+class AttendanceExportRow:
+    """One CSV-ready roster row (ATT-039). Mirrors the daily evaluation's
+    output shape plus per-day sighting aggregates; never carries embeddings."""
+
+    student_number: str
+    student_name: str
+    status: str  # evaluated verdict, or "unknown" when only sighted
+    confidence_score: str  # "" when the day's sightings carry no scores
+    last_sighting_at: str  # ISO 8601 UTC, "" when never sighted that day
+    override_applied: bool
+    override_reason: str
 
 
 class AttendanceServiceError(Exception):
@@ -307,6 +327,124 @@ class AttendanceService(
             records=records,
         )
 
+    async def export_daily_roster(
+        self,
+        *,
+        course_id: UUID,
+        session_date: date,
+    ) -> list[AttendanceExportRow]:
+        """Assemble one CSV-ready roster row per enrolled/seen student (ATT-039).
+
+        Reuses the daily-evaluation domain shape: the roster is the union of
+        aggregated ``class_session_records`` for the day and students sighted
+        in the course that day — no separate enrollment table exists, so
+        "enrolled/seen" follows exactly the same population
+        ``evaluate_class_attendance`` writes. Students sighted but not yet
+        evaluated export as status ``unknown``; evaluated rows keep their
+        verdict (including 'excused'/'late'). Override state is derived from
+        the ATT-038 notes prefix rather than a second persistence scheme.
+
+        Emits an ADVISORY ``EXPORT`` governance event (log-and-continue): a
+        ledger failure must never block delivery of a roster the requester is
+        already authorized to see. The summary carries counts only.
+
+        Memory: class sizes are hundreds, so a plain list is used instead of
+        a server-side cursor; embeddings are never selected.
+        """
+        await self._require_course(course_id)
+
+        window_start = datetime.combine(session_date, time.min, tzinfo=UTC)
+        window_end = window_start + timedelta(days=1)
+
+        existing_records = (
+            await self.session.execute(
+                select(ClassSessionRecord)
+                .where(ClassSessionRecord.course_id == course_id)
+                .where(ClassSessionRecord.session_date == session_date)
+            )
+        ).scalars().all()
+        records_by_student = {record.student_id: record for record in existing_records}
+
+        sighting_rows = (
+            await self.session.execute(
+                select(
+                    Sighting.student_id,
+                    func.avg(Sighting.confidence_score).label("avg_confidence"),
+                    func.max(Sighting.timestamp).label("last_sighting_at"),
+                )
+                .where(Sighting.course_id == course_id)
+                .where(Sighting.timestamp >= window_start)
+                .where(Sighting.timestamp < window_end)
+                .where(Sighting.student_id.is_not(None))
+                .group_by(Sighting.student_id)
+            )
+        ).all()
+        sightings_by_student = {
+            row.student_id: row for row in sighting_rows if row.student_id is not None
+        }
+
+        student_ids = set(records_by_student) | set(sightings_by_student)
+        export_rows: list[AttendanceExportRow] = []
+        if not student_ids:
+            return export_rows
+
+        identity_rows = (
+            await self.session.execute(
+                select(Student.id, Student.student_number, User.full_name)
+                .join(User, Student.user_id == User.id)
+                .where(Student.id.in_(student_ids))
+            )
+        ).all()
+        identities = {row.id: row for row in identity_rows}
+
+        for student_id in sorted(
+            student_ids,
+            key=lambda sid: (identities[sid].student_number, str(sid)),
+        ):
+            record = records_by_student.get(student_id)
+            sighting = sightings_by_student.get(student_id)
+            notes = record.notes if record is not None else None
+            override_applied = bool(notes) and notes.startswith(_OVERRIDE_NOTES_PREFIX)
+            avg_confidence = getattr(sighting, "avg_confidence", None)
+            last_sighting_at = getattr(sighting, "last_sighting_at", None)
+            export_rows.append(
+                AttendanceExportRow(
+                    student_number=identities[student_id].student_number,
+                    student_name=identities[student_id].full_name or "",
+                    status=record.status.value if record is not None else "unknown",
+                    confidence_score=(
+                        f"{float(avg_confidence):.4f}" if avg_confidence is not None else ""
+                    ),
+                    last_sighting_at=self._serialize_datetime(last_sighting_at),
+                    override_applied=override_applied,
+                    override_reason=(
+                        notes[len(_OVERRIDE_NOTES_PREFIX):].strip() if override_applied else ""
+                    ),
+                )
+            )
+
+        # Advisory emission (D1 revision for exports): strict=False so an
+        # audit-storage failure degrades to a log line. Read-only workload,
+        # so the rollback the wrapper performs cannot lose business writes.
+        async with self.transaction():
+            await emit(
+                self.session,
+                AuditEvent(
+                    action=GovernanceAction.EXPORT,
+                    entity_type="class_session_record",
+                    entity_id=course_id,
+                    actor_user_id=self._actor.id if self._actor is not None else None,
+                    change_summary={
+                        "session_date": session_date.isoformat(),
+                        "format": "csv",
+                        "rows": len(export_rows),
+                    },
+                ),
+                strict=False,
+            )
+
+        return export_rows
+
     async def apply_manual_override(
         self,
         *,
@@ -486,6 +624,7 @@ class AttendanceService(
 
 
 __all__ = [
+    "AttendanceExportRow",
     "AttendanceNotFoundError",
     "AttendanceService",
     "AttendanceServiceError",

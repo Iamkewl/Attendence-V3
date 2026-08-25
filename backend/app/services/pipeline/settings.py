@@ -23,6 +23,7 @@ class PipelineSettings:
     lvface_embedding_output_name: str | None
     face_crop_size: int
     tracking_distance_threshold: float
+    match_threshold: float
     yolo_bbox_format: str
     yolo_bbox_normalized: bool
 
@@ -60,6 +61,30 @@ def _read_float_env(name: str, default: float, *, min_value: float) -> float:
     if value < min_value:
         raise RuntimeError(
             f"Environment variable {name} must be greater than or equal to {min_value}."
+        )
+
+    return value
+
+
+def _read_match_threshold_env(name: str, default: float) -> float:
+    """Read the identity-match threshold; must satisfy 0 < value < 1 (ATT-077).
+
+    Same fail-closed style as ``_read_positive_int_env``: unset/empty falls
+    back to the default, malformed or out-of-range values abort startup with
+    a RuntimeError instead of silently degrading the acceptance rule.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be a floating-point number.") from exc
+
+    if not 0.0 < value < 1.0:
+        raise RuntimeError(
+            f"Environment variable {name} must be greater than 0 and less than 1."
         )
 
     return value
@@ -116,6 +141,7 @@ def get_pipeline_settings() -> PipelineSettings:
             96.0,
             min_value=1.0,
         ),
+        match_threshold=_read_match_threshold_env("ATTENDANCE_MATCH_THRESHOLD", 0.85),
         yolo_bbox_format=yolo_bbox_format,
         yolo_bbox_normalized=_read_bool_env("ATTENDANCE_TRITON_YOLO_BBOX_NORMALIZED", False),
     )

@@ -131,11 +131,15 @@ def test_mandatory_vs_advisory_classification_matrix() -> None:
         # ATT-044/038/045 (migration 20260824_0008) wired CONSENT_*/OVERRIDE_
         # APPLY/EMBED_HARD_DELETE, adding CONSENT_DENIED to the vocabulary.
         "CONSENT_GRANT", "CONSENT_WITHDRAW", "CONSENT_DENIED",
-        "OVERRIDE_APPLY", "EMBED_HARD_DELETE", "EXPORT",
+        "OVERRIDE_APPLY", "EMBED_HARD_DELETE",
     }
     advisory = {
         "LOGIN_SUCCEEDED", "LOGOUT", "INFERENCE_ENQUEUED",
         "TASK_READ", "RECOGNITION_RUN",
+        # ATT-039 reclassified EXPORT as advisory when it wired the writer
+        # (migration 20260824_0009): a ledger hiccup must never block a
+        # roster the requester is already authorized to receive.
+        "EXPORT",
     }
     assert {a.value for a in MANDATORY_ACTIONS} == mandatory
     assert not mandatory & advisory
