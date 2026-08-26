@@ -152,6 +152,26 @@ def _seconds_until(expires_at: datetime) -> int:
 _COOKIE_SAMESITE_VALUES = ("strict", "lax", "none")
 
 
+def _read_cookie_secure() -> bool:
+    """Read the Secure attribute for auth cookies (default: enabled).
+
+    Pilot escape hatch: browsers drop Secure cookies unless the origin is
+    HTTPS or an exempt trust context. Deployments serving plain HTTP on a
+    non-localhost origin (e.g. lab LAN IP) can set
+    ATTENDANCE_COOKIE_SECURE=false to allow session login at all. Never
+    disable in production — cookies would traverse the wire unencrypted.
+    """
+    raw = os.getenv("ATTENDANCE_COOKIE_SECURE", "true").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    if raw in {"0", "false", "no"}:
+        return False
+    raise RuntimeError(
+        "ATTENDANCE_COOKIE_SECURE must be a boolean-ish value "
+        "(true/false/yes/no/1/0)."
+    )
+
+
 def _read_cookie_samesite() -> str:
     """Read and validate the per-deployment cookie SameSite attribute.
 
@@ -192,7 +212,7 @@ def _set_auth_cookies(
 
     cookie_base_kwargs: dict[str, int | str | bool] = {
         "httponly": True,
-        "secure": True,
+        "secure": _read_cookie_secure(),
         # ATT-046: configurable via ATTENDANCE_COOKIE_SAMESITE; default
         # `strict` preserves the prior behavior. Reading the env here (not
         # via security.py's cached settings) is deliberate — the cookie
