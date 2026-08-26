@@ -151,6 +151,81 @@ async def extract_enrollment_embedding(
     return embedding, float(np.clip(quality_score, 0.0, 1.0))
 
 
+async def analyze_enrollment_frame(
+    face_tensor: np.ndarray,
+    *,
+    triton_client: TritonGrpcClient | None = None,
+) -> tuple[list[Detection], float]:
+    """Run detection + liveness-quality scoring WITHOUT computing an embedding.
+
+    Powers the live enrollment preview endpoint (``POST /students/enroll/preview``):
+    the caller needs the raw detections (count, largest bbox) and the same
+    quality proxy the enroll flow uses, but must not materialize biometric
+    embeddings on a 600ms-cadence polling path.
+
+    ``require_detection`` semantics mirror :func:`extract_enrollment_embedding`:
+    zero YOLO detections raises :class:`NoFaceDetectedError` instead of the
+    whole-frame-resize fallback. The preview ROUTE catches that and reports it
+    in-band as JSON (``detected=false``) rather than surfacing an HTTP error.
+    """
+    settings = get_pipeline_settings()
+    client = triton_client or get_triton_client()
+
+    if face_tensor.ndim != 3:
+        raise ValueError("Enrollment image tensor must be a rank-3 HWC tensor.")
+
+    normalized_tensor = np.ascontiguousarray(face_tensor.astype(np.float32, copy=False))
+    detector_input = _frame_to_model_input(normalized_tensor)
+    detection_outputs = await client.infer_fp32_async(
+        model_name=settings.yolo_model_name,
+        tensors={settings.yolo_input_name: detector_input},
+        output_names=[settings.yolo_output_name] if settings.yolo_output_name else None,
+    )
+    detections = _parse_detections(
+        frame_index=0,
+        frame_id="enroll_preview",
+        outputs=detection_outputs,
+        confidence_threshold=0.25,
+        frame_height=normalized_tensor.shape[0],
+        frame_width=normalized_tensor.shape[1],
+        preferred_output_name=settings.yolo_output_name,
+        bbox_format=settings.yolo_bbox_format,
+        bbox_normalized=settings.yolo_bbox_normalized,
+    )
+
+    if not detections:
+        raise NoFaceDetectedError("No face detected in enrollment preview frame.")
+
+    best_detection = max(detections, key=lambda candidate: candidate.score)
+    try:
+        aligned_face = _crop_face(
+            normalized_tensor,
+            best_detection.bbox,
+            crop_size=settings.face_crop_size,
+        )
+    except ValueError:
+        aligned_face = _resize_nearest(
+            normalized_tensor,
+            settings.face_crop_size,
+            settings.face_crop_size,
+        )
+
+    face_batch = _prepare_face_batch([aligned_face])
+    lvface_outputs = await client.infer_fp32_async(
+        model_name=settings.lvface_model_name,
+        tensors={settings.lvface_input_name: face_batch},
+        output_names=_build_lvface_output_names(settings),
+    )
+    liveness_tensor = _select_output_tensor(
+        lvface_outputs,
+        preferred_name=settings.lvface_liveness_output_name,
+        use_last_if_multiple=False,
+    )
+    quality_score = _decode_liveness_scores(liveness_tensor, expected_count=1)[0]
+
+    return detections, float(np.clip(quality_score, 0.0, 1.0))
+
+
 async def process_inference_batch(
     request: InferenceBatchRequest,
     *,

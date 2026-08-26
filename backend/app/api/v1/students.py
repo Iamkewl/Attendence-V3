@@ -15,24 +15,34 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentAdminUser, CurrentInstructorUser
+from app.api.deps import CurrentAdminUser, CurrentIngestUser, CurrentInstructorUser
 from app.core.database import get_async_session
 from app.core.security import get_security_settings
 from app.domain.models import Student, StudentEmbedding, TemplateAuditLog
 from app.domain.schemas import (
+    EnrollmentPreviewResponse,
     StudentConsentUpdate,
     StudentCreate,
     StudentEnrollmentRead,
     StudentRead,
     StudentUpdate,
 )
-from app.services.enrollment_quality import _resolve_enrollment_min_quality
+from app.services.enrollment_quality import (
+    PREVIEW_REASON_LOW_QUALITY,
+    PREVIEW_REASON_NO_FACE,
+    _resolve_enrollment_min_quality,
+    preview_reasons,
+)
 from app.services.audit_service import (
     AuditEvent,
     AuditService,
     GovernanceAction,
     resolve_request_context,
 )
+from app.services.pipeline_service import NoFaceDetectedError
+from app.services.pipeline_service import analyze_enrollment_frame
+# ATT-005 regression guard (test_smoke_pipeline_service) source-scans this
+# module for the exact single-line facade import below — keep it verbatim.
 from app.services.pipeline_service import extract_enrollment_embedding
 from app.services.student_service import StudentLinkValidationError, StudentService
 from app.infrastructure.triton import (
@@ -285,6 +295,92 @@ async def get_student(
     if student is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found.")
     return student
+
+
+# ---------------------------------------------------------------------------
+# Live enrollment preview (owner-requested phone-style UX).
+#
+# POST /students/enroll/preview evaluates ONE frame for capture ergonomics
+# and returns guidance JSON. Deliberate properties:
+#
+# - NO storage: no StudentEmbedding / TemplateAuditLog / governance rows, no
+#   DB session use in the handler body at all.
+# - NO embedding materialization: the orchestrator's analyze_enrollment_frame
+#   runs YOLO detection + the liveness quality head only — the 512D embedding
+#   is never computed on this polling path (biometric minimization).
+# - Detection failures are REPORTED in-band (detected=false + reason), not
+#   raised; only infrastructure failures (Triton down) surface as HTTP errors.
+# - Nothing is logged beyond the standard request line: no frames, no scores,
+#   no per-request log lines.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/enroll/preview",
+    response_model=EnrollmentPreviewResponse,
+    summary="Preview Enrollment Frame",
+    description=(
+        "Evaluate one live camera frame for enrollment readiness (detection, "
+        "lighting, blur, face size/centering). Returns guidance only — nothing "
+        "is stored and no embedding is computed."
+    ),
+)
+async def preview_enrollment_frame(
+    current_user: CurrentIngestUser,
+    image_file: Annotated[UploadFile, File(description="Live preview frame (JPEG or PNG).")],
+) -> EnrollmentPreviewResponse:
+    """Score one preview frame and report retake hints without storing anything."""
+    image_tensor = await _decode_enrollment_image(image_file)
+
+    try:
+        detections, quality_score = await analyze_enrollment_frame(image_tensor)
+    except NoFaceDetectedError:
+        return EnrollmentPreviewResponse(
+            ok=False,
+            detected=False,
+            num_faces=0,
+            bbox=None,
+            quality_score=None,
+            reasons=[PREVIEW_REASON_NO_FACE],
+        )
+    except (
+        TritonTimeoutError,
+        TritonServerUnavailableError,
+        TritonModelUnavailableError,
+        TritonInferenceError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding extraction service is unavailable. Please retry shortly.",
+        ) from exc
+
+    frame_height, frame_width = image_tensor.shape[:2]
+    bboxes_px = [detection.bbox for detection in detections]
+    reasons = preview_reasons(image_tensor, bboxes_px)
+
+    # Same fail-closed policy as the enroll gate: a frame whose quality proxy
+    # falls below ATTENDANCE_ENROLLMENT_MIN_QUALITY would 422 at submit time,
+    # so warn the operator now instead.
+    if quality_score < _resolve_enrollment_min_quality():
+        reasons.append(PREVIEW_REASON_LOW_QUALITY)
+
+    largest = max(detections, key=lambda candidate: candidate.bbox[2] * candidate.bbox[3])
+    x_px, y_px, w_px, h_px = largest.bbox
+    normalized_bbox = [
+        x_px / frame_width,
+        y_px / frame_height,
+        w_px / frame_width,
+        h_px / frame_height,
+    ]
+
+    return EnrollmentPreviewResponse(
+        ok=not reasons,
+        detected=True,
+        num_faces=len(detections),
+        bbox=normalized_bbox,
+        quality_score=float(quality_score),
+        reasons=reasons,
+    )
 
 
 @router.post(

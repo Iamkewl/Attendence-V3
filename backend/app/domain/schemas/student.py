@@ -117,3 +117,20 @@ class StudentEnrollmentRead(SchemaModel):
     quality_score: float
     is_active: bool
     created_at: datetime
+
+
+class EnrollmentPreviewResponse(SchemaModel):
+    """One live enrollment preview evaluation (no storage, no embeddings).
+
+    ``bbox`` is the normalized ``[x, y, w, h]`` (0..1) of the LARGEST face so
+    the client can draw an overlay rectangle at any display size. ``reasons``
+    holds machine-readable retake hints; ``ok`` is true only when a face was
+    detected and every diagnostic passed.
+    """
+
+    ok: bool
+    detected: bool
+    num_faces: int
+    bbox: Annotated[list[float], Field(min_length=4, max_length=4)] | None = None
+    quality_score: float | None = None
+    reasons: list[str]

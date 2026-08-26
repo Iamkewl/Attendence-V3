@@ -94,4 +94,15 @@ async def run_migrations_online() -> None:
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    asyncio.run(run_migrations_online())
+    # Run migrations on a PRIVATE event loop. asyncio.run() installs a fresh
+    # loop as the process-global current loop and resets it to None on exit
+    # (Runner.close -> set_event_loop(None)); after that point every
+    # asyncio.get_event_loop() in the same process (e.g. pytest-asyncio's
+    # per-fixture loop resolution when conftest runs `alembic upgrade head`
+    # in-process) raises "There is no current event loop". A private loop is
+    # semantically identical for migrations and leaves global state untouched.
+    _loop = asyncio.new_event_loop()
+    try:
+        _loop.run_until_complete(run_migrations_online())
+    finally:
+        _loop.close()

@@ -4,6 +4,7 @@ from .detection import Detection
 from .matching import EmbeddingMatch
 from .orchestrator import (
     NoFaceDetectedError,
+    analyze_enrollment_frame,
     extract_enrollment_embedding,
     process_inference_batch,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "NoFaceDetectedError",
     "PipelineSettings",
     "TrackedDetection",
+    "analyze_enrollment_frame",
     "extract_enrollment_embedding",
     "get_pipeline_settings",
     "process_inference_batch",
