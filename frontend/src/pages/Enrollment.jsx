@@ -1,15 +1,28 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AlertCircle, CheckCircle, RefreshCcw, UserCheck, UserPlus } from 'lucide-react'
+import { AlertCircle, Check, CheckCircle, RefreshCcw, UserCheck, UserPlus } from 'lucide-react'
 import client from '../api/client'
 import { useAuth } from '../auth/AuthContext'
 import WebcamCapture from './WebcamCapture'
 import StudentPicker from './StudentPicker'
 import NewStudentModal from '../components/NewStudentModal'
+import {
+  POSE_LABELS,
+  POSE_SEQUENCE,
+  PREVIEW_ENDPOINT,
+  PREVIEW_INTERVAL_MS,
+  PREVIEW_MAX_SIDE,
+  advancePose,
+  decideOk,
+  initialPoseMachine,
+  isHardError,
+  poseDone,
+} from './enrollLogic'
 
 const CREATE_STUDENT_ROLES = ['admin', 'instructor']
 
 const ENROLL_ENDPOINT = (studentId) => `/api/v1/students/${studentId}/enroll`
+const COVERAGE_URL = '/api/v1/admin/enrollment-coverage'
 const QUALITY_WARNING_THRESHOLD = 0.6
 
 function resolveErrorMessage(err) {
@@ -196,6 +209,387 @@ function SuccessCard({ record, qualityWarning, onEnrollAnother }) {
   )
 }
 
+// ── Live guided capture (phone-style) ─────────────────────────────────────
+
+const chipStyle = (tone) => ({
+  display: 'inline-flex',
+  alignItems: 'center',
+  gap: 6,
+  padding: '4px 10px',
+  borderRadius: 999,
+  fontSize: '0.78rem',
+  fontWeight: 600,
+  border: `1px solid ${tone === 'ok' ? 'rgba(18,102,70,0.35)' : 'rgba(180,83,9,0.35)'}`,
+  background: tone === 'ok' ? 'var(--present-bg)' : 'var(--late-bg)',
+  color: tone === 'ok' ? 'var(--present-text)' : 'var(--late-text)',
+})
+
+// Draws the bbox overlay rectangle for one preview evaluation. The reason
+// chips themselves are DOM elements (accessible + testable); only the
+// rectangle goes on the canvas.
+function drawBboxOverlay(canvasEl, data) {
+  if (!canvasEl || typeof canvasEl.getContext !== 'function') return
+  const ctx = canvasEl.getContext('2d')
+  if (!ctx) return
+  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height)
+  if (!Array.isArray(data?.bbox) || data.bbox.length !== 4) return
+  const [x, y, w, h] = data.bbox
+  ctx.strokeStyle = data.ok ? '#16a34a' : '#d97706'
+  ctx.lineWidth = 3
+  ctx.strokeRect(x * canvasEl.width, y * canvasEl.height, w * canvasEl.width, h * canvasEl.height)
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve) => {
+    if (!canvas || typeof canvas.toBlob !== 'function') {
+      resolve(null)
+      return
+    }
+    canvas.toBlob((blob) => resolve(blob), 'image/jpeg', 0.92)
+  })
+}
+
+function LiveEnrollmentPanel({ studentId }) {
+  const videoRef = useRef(null)
+  const workCanvasRef = useRef(null)
+  const fullCanvasRef = useRef(null)
+  const overlayCanvasRef = useRef(null)
+  const streamRef = useRef(null)
+  const tickRef = useRef(null)
+  const pauseRef = useRef(false)
+  const haltedRef = useRef(false)
+  const poseRef = useRef(initialPoseMachine())
+  const queueRef = useRef([null, null, null])
+  const grabPromisesRef = useRef([null, null, null])
+
+  const [cameraOn, setCameraOn] = useState(false)
+  const [liveError, setLiveError] = useState('')
+  const [previewChips, setPreviewChips] = useState([])
+  const [previewOk, setPreviewOk] = useState(false)
+  const [poseUi, setPoseUi] = useState(initialPoseMachine())
+  const [capturedPoses, setCapturedPoses] = useState([false, false, false])
+  const [poseOutcomes, setPoseOutcomes] = useState(null)
+  const [submittingLive, setSubmittingLive] = useState(false)
+
+  // Full-res frame grab for auto-capture at the moment a pose completes.
+  const grabFullRes = useCallback(async () => {
+    const video = videoRef.current
+    const canvas = fullCanvasRef.current
+    if (!video || !canvas || !video.videoWidth) return null
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    return canvasToBlob(canvas)
+  }, [])
+
+  const runSubmissions = useCallback(async () => {
+    pauseRef.current = true
+    setSubmittingLive(true)
+    const outcomes = []
+    for (let i = 0; i < POSE_SEQUENCE.length; i += 1) {
+      const blob = await grabPromisesRef.current[i]
+      if (!blob) {
+        outcomes.push({ pose: POSE_SEQUENCE[i], status: 'failed', message: 'Frame missing — redo guided capture.' })
+        continue
+      }
+      const formData = new FormData()
+      formData.append('image_file', blob, `${POSE_LABELS[i]}.jpg`)
+      formData.append('pose_label', POSE_LABELS[i])
+      try {
+        await client.post(ENROLL_ENDPOINT(studentId), formData, {
+          headers: { 'Content-Type': undefined },
+        })
+        outcomes.push({ pose: POSE_SEQUENCE[i], status: 'saved' })
+      } catch (err) {
+        if (isHardError(err)) {
+          haltedRef.current = true
+          setLiveError(resolveErrorMessage(err))
+          break
+        }
+        outcomes.push({ pose: POSE_SEQUENCE[i], status: 'failed', message: resolveErrorMessage(err) })
+      }
+    }
+    setPoseOutcomes(outcomes)
+    setSubmittingLive(false)
+    pauseRef.current = false
+  }, [studentId])
+
+  const applyPreview = useCallback(
+    (data) => {
+      drawBboxOverlay(overlayCanvasRef.current, data)
+      const ok = decideOk(data)
+      setPreviewOk(ok)
+      setPreviewChips(Array.isArray(data?.reasons) ? data.reasons : [])
+
+      if (pauseRef.current || haltedRef.current || poseDone(poseRef.current)) return
+
+      const prev = poseRef.current
+      const next = advancePose(prev, ok)
+      if (next === prev) return
+      poseRef.current = next
+      setPoseUi(next)
+
+      if (next.completedCount > prev.completedCount) {
+        const poseIdx = prev.poseIndex
+        grabPromisesRef.current[poseIdx] = grabFullRes().then((blob) => {
+          queueRef.current[poseIdx] = blob
+          setCapturedPoses((q) => q.map((v, idx) => (idx === poseIdx ? true : v)))
+          return blob
+        })
+        if (next.completedCount === POSE_SEQUENCE.length) {
+          void runSubmissions()
+        }
+      }
+    },
+    [grabFullRes, runSubmissions],
+  )
+
+  // One sampler tick: downscale → JPEG → preview POST → overlay + guidance.
+  const runTick = useCallback(async () => {
+    if (pauseRef.current) return
+    const video = videoRef.current
+    const work = workCanvasRef.current
+    if (!video || !work || !video.videoWidth) return
+
+    const scale = PREVIEW_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight)
+    work.width = Math.round(video.videoWidth * scale)
+    work.height = Math.round(video.videoHeight * scale)
+    const overlay = overlayCanvasRef.current
+    if (overlay) {
+      overlay.width = video.videoWidth
+      overlay.height = video.videoHeight
+    }
+    const ctx = typeof work.getContext === 'function' ? work.getContext('2d') : null
+    if (!ctx) return
+    ctx.drawImage(video, 0, 0, work.width, work.height)
+
+    const blob = await canvasToBlob(work)
+    if (!blob) return
+
+    const formData = new FormData()
+    formData.append('image_file', blob, 'preview.jpg')
+    try {
+      const response = await client.post(PREVIEW_ENDPOINT, formData, {
+        headers: { 'Content-Type': undefined },
+      })
+      applyPreview(response.data)
+    } catch (err) {
+      if (isHardError(err)) {
+        haltedRef.current = true
+        setLiveError(resolveErrorMessage(err))
+      }
+    }
+  }, [applyPreview])
+
+  useEffect(() => {
+    tickRef.current = runTick
+  })
+
+  // Sampler lifecycle — cleared on unmount or camera stop.
+  useEffect(() => {
+    if (!cameraOn) return undefined
+    const id = window.setInterval(() => {
+      void tickRef.current?.()
+    }, PREVIEW_INTERVAL_MS)
+    return () => window.clearInterval(id)
+  }, [cameraOn])
+
+  const handleEnableCamera = useCallback(async () => {
+    setLiveError('')
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        audio: false,
+      })
+      streamRef.current = stream
+      setCameraOn(true)
+    } catch (err) {
+      const name = err?.name || ''
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setLiveError('Camera permission was denied. Please allow camera access and try again.')
+      } else if (name === 'NotFoundError') {
+        setLiveError('No camera detected on this device.')
+      } else {
+        setLiveError(err.message || 'Unable to access camera.')
+      }
+    }
+  }, [])
+
+  // Attach stream once the <video> mounts; stop tracks on unmount/teardown
+  // (same hygiene as WebcamCapture's manual path).
+  useEffect(() => {
+    if (!cameraOn) return undefined
+    const video = videoRef.current
+    if (video && streamRef.current) {
+      video.srcObject = streamRef.current
+      try {
+        const played = video.play()
+        played?.catch?.(() => {})
+      } catch {
+        /* autoplay rejection is fine — user gesture already happened */
+      }
+    }
+    return () => {
+      streamRef.current?.getTracks?.().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+  }, [cameraOn])
+
+  const handleResetGuided = useCallback(() => {
+    poseRef.current = initialPoseMachine()
+    queueRef.current = [null, null, null]
+    grabPromisesRef.current = [null, null, null]
+    haltedRef.current = false
+    setPoseUi(initialPoseMachine())
+    setCapturedPoses([false, false, false])
+    setPoseOutcomes(null)
+    setLiveError('')
+  }, [])
+
+  const allSaved =
+    Array.isArray(poseOutcomes) &&
+    poseOutcomes.length === POSE_SEQUENCE.length &&
+    poseOutcomes.every((o) => o.status === 'saved')
+
+  if (allSaved) {
+    return (
+      <div
+        style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, padding: '18px 0' }}
+        role="status"
+        aria-live="polite"
+      >
+        <CheckCircle size={40} style={{ color: 'var(--present-text)' }} aria-hidden="true" />
+        <h3 style={{ margin: 0, fontFamily: 'Space Grotesk, sans-serif' }}>
+          Guided enrollment complete
+        </h3>
+        <p style={{ margin: 0, color: 'var(--text-soft)' }}>
+          All three poses were enrolled successfully for this student.
+        </p>
+        <a href={COVERAGE_URL} className="ghost-btn" style={{ textDecoration: 'none' }}>
+          View enrollment coverage
+        </a>
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
+      {!cameraOn ? (
+        <div className="empty-state" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+          <p style={{ fontWeight: 600 }}>Live guided mode</p>
+          <small>Follow the on-screen poses — capture happens automatically.</small>
+          <button type="button" className="solid-btn" onClick={handleEnableCamera} aria-label="Enable live camera">
+            Enable Camera
+          </button>
+        </div>
+      ) : (
+        <>
+          <div style={{ position: 'relative', width: '100%', maxWidth: 640 }}>
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              aria-label="Live guided enrollment preview"
+              style={{
+                width: '100%',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--border)',
+                background: '#000',
+                display: 'block',
+              }}
+            />
+            <canvas
+              ref={overlayCanvasRef}
+              aria-hidden="true"
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                pointerEvents: 'none',
+              }}
+            />
+          </div>
+
+          {/* Reason chips from the latest preview evaluation */}
+          <ul
+            aria-label="Preview diagnostics"
+            style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center', listStyle: 'none', margin: 0, padding: 0 }}
+          >
+            {previewChips.length === 0 && previewOk ? (
+              <li key="ready" style={chipStyle('ok')}>
+                Ready to capture
+              </li>
+            ) : (
+              previewChips.map((reason) => (
+                <li key={reason} style={chipStyle('warn')}>
+                  {reason}
+                </li>
+              ))
+            )}
+          </ul>
+
+          {/* Pose progress with per-pose checkmarks */}
+          <ol
+            aria-label="Guided pose progress"
+            style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center', listStyle: 'none', margin: 0, padding: 0 }}
+          >
+            {POSE_SEQUENCE.map((label, i) => {
+              const captured = capturedPoses[i]
+              const current = poseUi.poseIndex === i && !captured
+              return (
+                <li
+                  key={label}
+                  aria-current={current ? 'step' : undefined}
+                  style={{
+                    ...chipStyle(captured ? 'ok' : current ? 'warn' : 'idle'),
+                    opacity: captured || current ? 1 : 0.6,
+                  }}
+                >
+                  {captured && <Check size={13} aria-hidden="true" />}
+                  <span>{label}</span>
+                  {captured && <span aria-label="captured">✓</span>}
+                </li>
+              )
+            })}
+          </ol>
+
+          {submittingLive && <p style={{ margin: 0, fontWeight: 600 }}>Submitting poses…</p>}
+
+          {Array.isArray(poseOutcomes) && (
+            <ul aria-label="Pose submission results" style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {poseOutcomes.map((outcome) => (
+                <li key={outcome.pose} style={chipStyle(outcome.status === 'saved' ? 'ok' : 'warn')}>
+                  {outcome.pose}: {outcome.status === 'saved' ? 'enrolled ✓' : outcome.message}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <button type="button" className="ghost-btn" onClick={handleResetGuided} disabled={submittingLive}>
+            <RefreshCcw size={14} aria-hidden="true" />
+            <span>Redo guided capture</span>
+          </button>
+
+          {/* Hidden capture surfaces */}
+          <canvas ref={workCanvasRef} style={{ display: 'none' }} />
+          <canvas ref={fullCanvasRef} style={{ display: 'none' }} />
+        </>
+      )}
+
+      {liveError && (
+        <div className="alert-banner" role="alert">
+          <AlertCircle size={16} aria-hidden="true" />
+          <span>{liveError}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main page ──────────────────────────────────────────────────────────────
 
 export default function Enrollment() {
@@ -214,6 +608,8 @@ export default function Enrollment() {
   const [showNewStudentModal, setShowNewStudentModal] = useState(false)
   const [studentListKey, setStudentListKey] = useState(0)
   const [createdToast, setCreatedToast] = useState('')
+  // Capture UX: 'manual' (snapshot button) or 'live' (guided auto-capture).
+  const [captureMode, setCaptureMode] = useState('manual')
 
   const canCreateStudent = CREATE_STUDENT_ROLES.includes(user?.role)
 
@@ -493,13 +889,37 @@ export default function Enrollment() {
             </div>
           )}
 
-          <WebcamCapture
-            onCapture={handleCapture}
-            capturedBlob={capturedBlob}
-            onRetake={handleRetake}
-            onSubmit={handleSubmit}
-            isSubmitting={false}
-          />
+          {/* Mode switch: guided live capture vs manual snapshot */}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }} role="group" aria-label="Capture mode">
+            <button
+              type="button"
+              className={captureMode === 'live' ? 'solid-btn' : 'ghost-btn'}
+              onClick={() => setCaptureMode('live')}
+              aria-pressed={captureMode === 'live'}
+            >
+              <span>Live Guided Mode</span>
+            </button>
+            <button
+              type="button"
+              className={captureMode === 'manual' ? 'solid-btn' : 'ghost-btn'}
+              onClick={() => setCaptureMode('manual')}
+              aria-pressed={captureMode === 'manual'}
+            >
+              <span>Manual Capture</span>
+            </button>
+          </div>
+
+          {captureMode === 'live' ? (
+            <LiveEnrollmentPanel studentId={selectedStudent?.id} />
+          ) : (
+            <WebcamCapture
+              onCapture={handleCapture}
+              capturedBlob={capturedBlob}
+              onRetake={handleRetake}
+              onSubmit={handleSubmit}
+              isSubmitting={false}
+            />
+          )}
         </div>
       )}
     </section>
