@@ -44,6 +44,7 @@ from .inference import (
 )
 from .student import (
     EnrollmentCoverageRow,
+    EnrollmentPreviewResponse,
     StudentConsentUpdate,
     StudentCreate,
     StudentEnrollmentRead,
@@ -69,6 +70,7 @@ __all__ = [
     "CourseRead",
     "CourseUpdate",
     "EnrollmentCoverageRow",
+    "EnrollmentPreviewResponse",
     "GovernanceLogCreate",
     "GovernanceLogRead",
     "ImageTensorPayload",

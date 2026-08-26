@@ -25,10 +25,47 @@ Semantics are unchanged from ATT-029:
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
+
+import numpy as np
 
 
 _ENROLLMENT_MIN_QUALITY_DEFAULT = 0.5
 _ENROLLMENT_MIN_QUALITY_ENV_NAME = "ATTENDANCE_ENROLLMENT_MIN_QUALITY"
+
+# ---------------------------------------------------------------------------
+# Live enrollment preview diagnostics (owner-requested phone-style UX).
+#
+# Cheap numpy-only heuristics evaluated per preview frame so the client gets
+# actionable retake hints BEFORE hitting the real enroll endpoint. Thresholds
+# are module constants (not env-tunable) on purpose: they describe universal
+# image-capture ergonomics, not deployment policy.
+# ---------------------------------------------------------------------------
+
+PREVIEW_REASON_NO_FACE = "NO_FACE_DETECTED"
+PREVIEW_REASON_POOR_LIGHTING = "POOR_LIGHTING"
+PREVIEW_REASON_MOTION_BLUR = "MOTION_BLUR"
+PREVIEW_REASON_FACE_TOO_SMALL = "FACE_TOO_SMALL"
+PREVIEW_REASON_NOT_CENTERED = "NOT_CENTERED"
+PREVIEW_REASON_MULTIPLE_FACES = "MULTIPLE_FACES"
+PREVIEW_REASON_LOW_QUALITY = "LOW_QUALITY"
+
+# Mean Rec.601 luma bounds: below 45 is a dark room, above 215 blows out the
+# sensor and washes the face.
+_MIN_MEAN_LUMA = 45.0
+_MAX_MEAN_LUMA = 215.0
+
+# Variance of the horizontal gradient: sharp frames have rich high-frequency
+# content; motion blur flattens it toward zero.
+_MOTION_BLUR_GRADIENT_VARIANCE_MIN = 100.0
+
+# The largest face box must cover at least 4% of the frame area.
+_MIN_FACE_AREA_FRACTION = 0.04
+
+# The largest face center must sit inside the central 60% region.
+_CENTER_REGION_HALF_SPAN = 0.2  # central band = [0.2, 0.8] per axis
+
+_LUMA_WEIGHTS_RGB = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 
 def _resolve_enrollment_min_quality() -> float:
@@ -61,3 +98,70 @@ def _resolve_enrollment_min_quality() -> float:
             f"float in [0.0, 1.0]; got {value!r}."
         )
     return value
+
+
+def mean_luma(frame_rgb: np.ndarray) -> float:
+    """Mean Rec.601 luma of an HWC RGB frame (values expected in 0..255)."""
+    tensor = np.asarray(frame_rgb, dtype=np.float32)
+    if tensor.ndim != 3 or tensor.shape[2] < 3:
+        raise ValueError("Frame must be a rank-3 HWC RGB tensor.")
+    luma = tensor[..., :3] @ _LUMA_WEIGHTS_RGB
+    return float(luma.mean())
+
+
+def horizontal_gradient_variance(frame_rgb: np.ndarray) -> float:
+    """Variance of horizontal luminance gradients — a cheap blur proxy.
+
+    Sharp frames carry high-frequency detail (large gradient variance);
+    motion-blurred frames collapse toward zero.
+    """
+    tensor = np.asarray(frame_rgb, dtype=np.float32)
+    if tensor.ndim != 3 or tensor.shape[2] < 3:
+        raise ValueError("Frame must be a rank-3 HWC RGB tensor.")
+    luma = tensor[..., :3] @ _LUMA_WEIGHTS_RGB
+    gradient = np.diff(luma, axis=1)
+    return float(gradient.var())
+
+
+def preview_reasons(
+    frame_rgb: np.ndarray,
+    bboxes_px: Sequence[tuple[float, float, float, float]],
+) -> list[str]:
+    """Evaluate the preview diagnostics for one frame.
+
+    ``bboxes_px`` are pixel-space ``(x, y, w, h)`` boxes from the detector.
+    Returns the reason-code list in deterministic order; an empty list means
+    the frame passes every diagnostic and is ready to capture. Zero boxes is
+    reported by the caller as ``NO_FACE_DETECTED`` (the route owns that path).
+    """
+    if not bboxes_px:
+        return [PREVIEW_REASON_NO_FACE]
+
+    height, width = np.asarray(frame_rgb).shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("Frame dimensions must be positive.")
+
+    reasons: list[str] = []
+
+    luma = mean_luma(frame_rgb)
+    if luma < _MIN_MEAN_LUMA or luma > _MAX_MEAN_LUMA:
+        reasons.append(PREVIEW_REASON_POOR_LIGHTING)
+
+    if horizontal_gradient_variance(frame_rgb) < _MOTION_BLUR_GRADIENT_VARIANCE_MIN:
+        reasons.append(PREVIEW_REASON_MOTION_BLUR)
+
+    x, y, box_w, box_h = max(bboxes_px, key=lambda bbox: bbox[2] * bbox[3])
+    frame_area = float(width * height)
+    if (box_w * box_h) / frame_area < _MIN_FACE_AREA_FRACTION:
+        reasons.append(PREVIEW_REASON_FACE_TOO_SMALL)
+
+    center_x = (x + box_w / 2.0) / width
+    center_y = (y + box_h / 2.0) / height
+    span = _CENTER_REGION_HALF_SPAN
+    if not (span <= center_x <= 1.0 - span and span <= center_y <= 1.0 - span):
+        reasons.append(PREVIEW_REASON_NOT_CENTERED)
+
+    if len(bboxes_px) > 1:
+        reasons.append(PREVIEW_REASON_MULTIPLE_FACES)
+
+    return reasons
