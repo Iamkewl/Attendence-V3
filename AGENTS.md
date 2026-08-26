@@ -86,3 +86,10 @@ make demo                                       # full stack + seed (seeder prin
 - tritonclient 2.70 gRPC: never pass `binary_data=` to
   `set_data_from_numpy`, and never `request_id=None`.
 - Design specs + owner decision record live in `docs/design/`.
+
+## Pilot-data rule (2026-08-26)
+
+- NEVER run the full test suite against a database holding pilot/demo or
+  real data — conftest truncates tables. Always export BOTH
+  `ATTENDANCE_DATABASE_URL` and `ATTENDANCE_DATABASE_URL_TEST`, with
+  `_TEST` pointing at a scratch DB (e.g. `attendance_test`).
