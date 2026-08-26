@@ -167,6 +167,11 @@ async def seed() -> None:
         else:
             skipped.append("Course DEMO-101 — already exists")
 
+        # autoflush is disabled on this session; the link INSERT below
+        # FK-checks user/course rows that are still only pending in the
+        # session — flush them first or the INSERT fails.
+        await session.flush()
+
         # --- Demo course owner link (ATT-016) ---
         existing_link = await session.get(CourseInstructor, DEMO_COURSE_INSTRUCTOR_ID)
         if existing_link is None:
