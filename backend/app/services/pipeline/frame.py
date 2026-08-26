@@ -53,8 +53,22 @@ def _frame_to_model_input(frame_tensor: np.ndarray) -> np.ndarray:
     if channels == 1:
         frame_tensor = np.repeat(frame_tensor, 3, axis=2)
 
-    nchw = np.transpose(frame_tensor, (2, 0, 1))[np.newaxis, :, :, :]
-    return np.ascontiguousarray(nchw, dtype=np.float32)
+    nchw = np.transpose(frame_tensor, (2, 0, 1))[np.newaxis, :, :, :].astype(np.float32)
+
+    # YOLOv12's neck concatenates pyramid feature maps whose spatial sizes
+    # derive from ceil/floor division of the input dims by different strides;
+    # an input whose H or W is not a multiple of 32 makes those sizes
+    # disagree by one and ONNX Runtime fails inside the head Concat node
+    # ("Non concat axis dimensions must match"). Zero-pad bottom/right to
+    # the next multiple of 32: existing pixel coordinates are untouched, so
+    # bbox decoding against the ORIGINAL frame dims stays exact.
+    stride = 32
+    h, w = nchw.shape[2], nchw.shape[3]
+    pad_h, pad_w = (-h) % stride, (-w) % stride
+    if pad_h or pad_w:
+        nchw = np.pad(nchw, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)))
+
+    return np.ascontiguousarray(nchw)
 
 
 def _extract_detection_rows(raw_tensor: np.ndarray) -> np.ndarray:
