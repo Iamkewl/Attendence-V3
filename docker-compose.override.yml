@@ -1,0 +1,12 @@
+services:
+  api:
+    ports: !override
+      - "8080:8000"
+    environment:
+      TRITON_URL_OVERRIDE: ""
+      ATTENDANCE_TRITON_URL: "http://host.docker.internal:8000"
+      ATTENDANCE_TRITON_LVFACE_LIVENESS_OUTPUT_NAME: "LIVENESS__0"
+      ATTENDANCE_TRITON_LVFACE_EMBEDDING_OUTPUT_NAME: "EMBEDDING__1"
+      ATTENDANCE_ALLOWED_ORIGINS: "http://localhost:4173"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
